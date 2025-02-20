@@ -15,9 +15,41 @@ from contextlib import asynccontextmanager
 console = Console()
 
 # Configuration
-SQLITE_DB_PATH = Path('webui.db')
 BATCH_SIZE = 500
 MAX_RETRIES = 3
+
+def get_sqlite_config() -> Path:
+    """Interactive configuration for SQLite database path"""
+    console.print(Panel("SQLite Database Configuration", style="cyan"))
+    
+    default_path = 'webui.db'
+    while True:
+        db_path = Path(Prompt.ask(
+            "[cyan]SQLite database path[/]",
+            default=default_path
+        ))
+        
+        # Check if file exists
+        if not db_path.exists():
+            console.print(f"\n[red]Error: File '{db_path}' does not exist[/]")
+            if not Confirm.ask("\n[yellow]Would you like to try a different path?[/]"):
+                console.print("[red]Migration cancelled by user[/]")
+                sys.exit(0)
+            continue
+            
+        # Try to open the database to verify it's a valid SQLite file
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT sqlite_version()")
+                version = cursor.fetchone()[0]
+                console.print(f"\n[green]✓ Valid SQLite database (version {version})[/]")
+                return db_path
+        except sqlite3.Error as e:
+            console.print(f"\n[red]Error: Not a valid SQLite database: {str(e)}[/]")
+            if not Confirm.ask("\n[yellow]Would you like to try a different path?[/]"):
+                console.print("[red]Migration cancelled by user[/]")
+                sys.exit(0)
 
 def test_pg_connection(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     """Test PostgreSQL connection and return (success, error_message)"""
@@ -114,12 +146,12 @@ def get_pg_config() -> Dict[str, Any]:
         
         return config
 
-def check_sqlite_integrity() -> bool:
+def check_sqlite_integrity(db_path: Path) -> bool:
     """Run integrity check on SQLite database"""
     console.print(Panel("Running SQLite Database Integrity Check", style="cyan"))
     
     try:
-        with sqlite3.connect(SQLITE_DB_PATH) as conn:
+        with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
             
             checks = [
@@ -175,14 +207,14 @@ def get_pg_safe_identifier(identifier: str) -> str:
     return f'"{identifier}"' if identifier.lower() in reserved_keywords else identifier
 
 @asynccontextmanager
-async def async_db_connections(pg_config: Dict[str, Any]):
+async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
     sqlite_conn = None
     pg_conn = None
     
     try:
         # Try SQLite connection first
         try:
-            sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=60)
+            sqlite_conn = sqlite3.connect(sqlite_path, timeout=60)
             sqlite_conn.execute('PRAGMA journal_mode=WAL')
             sqlite_conn.execute('PRAGMA synchronous=NORMAL')
         except sqlite3.Error as e:
@@ -357,7 +389,10 @@ async def process_table(
         raise
 
 async def migrate() -> None:
-    if not check_sqlite_integrity():
+    # Get SQLite database path
+    sqlite_path = get_sqlite_config()
+    
+    if not check_sqlite_integrity(sqlite_path):
         console.print("[bold red]Aborting migration due to database integrity issues[/]")
         sys.exit(1)
 
@@ -366,7 +401,7 @@ async def migrate() -> None:
     # Get PostgreSQL configuration
     pg_config = get_pg_config()
     
-    async with async_db_connections(pg_config) as (sqlite_conn, pg_conn):
+    async with async_db_connections(sqlite_path, pg_config) as (sqlite_conn, pg_conn):
         sqlite_cursor = sqlite_conn.cursor()
         pg_cursor = pg_conn.cursor()
         
