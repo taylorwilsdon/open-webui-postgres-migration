@@ -15,7 +15,6 @@ from contextlib import asynccontextmanager
 console = Console()
 
 # Configuration
-BATCH_SIZE = 500
 MAX_RETRIES = 3
 
 def get_sqlite_config() -> Path:
@@ -146,6 +145,30 @@ def get_pg_config() -> Dict[str, Any]:
         
         return config
 
+def get_batch_config() -> int:
+    """Interactive configuration for batch size"""
+    console.print(Panel("Batch Size Configuration", style="cyan"))
+    
+    console.print("[cyan]The batch size determines how many records are processed at once.[/]")
+    console.print("[cyan]A larger batch size may be faster but uses more memory.[/]")
+    console.print("[cyan]Recommended range: 100-5000[/]\n")
+    
+    while True:
+        batch_size = IntPrompt.ask(
+            "[cyan]Batch size[/]",
+            default=500
+        )
+        
+        if batch_size < 1:
+            console.print("[red]Batch size must be at least 1[/]")
+            continue
+            
+        if batch_size > 10000:
+            if not Confirm.ask("[yellow]Large batch sizes may cause memory issues. Continue anyway?[/]"):
+                continue
+        
+        return batch_size
+
 def check_sqlite_integrity(db_path: Path) -> bool:
     """Run integrity check on SQLite database"""
     console.print(Panel("Running SQLite Database Integrity Check", style="cyan"))
@@ -249,7 +272,8 @@ async def process_table(
     table_name: str,
     sqlite_cursor: sqlite3.Cursor,
     pg_cursor: psycopg.Cursor,
-    progress: Progress
+    progress: Progress,
+    batch_size: int
 ) -> None:
     pg_safe_table_name = get_pg_safe_identifier(table_name)
     sqlite_safe_table_name = get_sqlite_safe_identifier(table_name)
@@ -309,7 +333,7 @@ async def process_table(
         while processed_rows < total_rows:
             try:
                 sqlite_cursor.execute(
-                    f"SELECT * FROM {sqlite_safe_table_name} LIMIT {BATCH_SIZE} OFFSET {processed_rows}"
+                    f"SELECT * FROM {sqlite_safe_table_name} LIMIT {batch_size} OFFSET {processed_rows}"
                 )
                 raw_rows = sqlite_cursor.fetchall()
                 
@@ -371,7 +395,7 @@ async def process_table(
             except sqlite3.DatabaseError as e:
                 console.print(f"[red]SQLite error during batch processing: {e}[/]")
                 console.print("[yellow]Attempting to continue with next batch...[/]")
-                processed_rows += BATCH_SIZE
+                processed_rows += batch_size
                 continue
 
         if failed_rows:
@@ -396,10 +420,13 @@ async def migrate() -> None:
         console.print("[bold red]Aborting migration due to database integrity issues[/]")
         sys.exit(1)
 
-    console.print(Panel("Starting Migration Process", style="cyan"))
-    
     # Get PostgreSQL configuration
     pg_config = get_pg_config()
+    
+    # Get batch size configuration
+    batch_size = get_batch_config()
+    
+    console.print(Panel("Starting Migration Process", style="cyan"))
     
     async with async_db_connections(sqlite_path, pg_config) as (sqlite_conn, pg_conn):
         sqlite_cursor = sqlite_conn.cursor()
@@ -419,7 +446,13 @@ async def migrate() -> None:
                     if table_name in ("migratehistory", "alembic_version"):
                         continue
                     
-                    await process_table(table_name, sqlite_cursor, pg_cursor, progress)
+                    await process_table(
+                        table_name, 
+                        sqlite_cursor, 
+                        pg_cursor, 
+                        progress,
+                        batch_size
+                    )
                     
                 console.print(Panel("Migration Complete!", style="green"))
                 
