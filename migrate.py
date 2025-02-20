@@ -20,14 +20,14 @@ MAX_RETRIES = 3
 def get_sqlite_config() -> Path:
     """Interactive configuration for SQLite database path"""
     console.print(Panel("SQLite Database Configuration", style="cyan"))
-    
+
     default_path = 'webui.db'
     while True:
         db_path = Path(Prompt.ask(
             "[cyan]SQLite database path[/]",
             default=default_path
         ))
-        
+
         # Check if file exists
         if not db_path.exists():
             console.print(f"\n[red]Error: File '{db_path}' does not exist[/]")
@@ -35,7 +35,7 @@ def get_sqlite_config() -> Path:
                 console.print("[red]Migration cancelled by user[/]")
                 sys.exit(0)
             continue
-            
+
         # Try to open the database to verify it's a valid SQLite file
         try:
             with sqlite3.connect(db_path) as conn:
@@ -74,9 +74,9 @@ def get_pg_config() -> Dict[str, Any]:
     """Interactive configuration for PostgreSQL connection"""
     while True:
         console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
-        
+
         config = {}
-        
+
         # Default values
         defaults = {
             'host': 'localhost',
@@ -84,129 +84,129 @@ def get_pg_config() -> Dict[str, Any]:
             'dbname': 'postgres',
             'user': 'postgres',
         }
-        
+
         config['host'] = Prompt.ask(
             "[cyan]PostgreSQL host[/]",
             default=defaults['host']
         )
-        
+
         config['port'] = IntPrompt.ask(
             "[cyan]PostgreSQL port[/]",
             default=defaults['port']
         )
-        
+
         config['dbname'] = Prompt.ask(
             "[cyan]Database name[/]",
             default=defaults['dbname']
         )
-        
+
         config['user'] = Prompt.ask(
             "[cyan]Username[/]",
             default=defaults['user']
         )
-        
+
         config['password'] = Prompt.ask(
             "[cyan]Password[/]",
             password=True
         )
-        
+
         # Show summary
         summary = Table(show_header=False, box=None)
         for key, value in config.items():
             if key != 'password':
                 summary.add_row(f"[cyan]{key}:[/]", str(value))
         summary.add_row("[cyan]password:[/]", "********")
-        
+
         console.print("\nConnection Details:")
         console.print(summary)
-        
+
         # Test connection
         with console.status("[cyan]Testing database connection...[/]"):
             success, error_msg = test_pg_connection(config)
-        
+
         if not success:
             console.print(f"\n[red]Connection Error: {error_msg}[/]")
-            
+
             if not Confirm.ask("\n[yellow]Would you like to try again?[/]"):
                 console.print("[red]Migration cancelled by user[/]")
                 sys.exit(0)
-            
+
             console.print("\n")  # Add spacing before retry
             continue
-        
+
         console.print("\n[green]✓ Database connection successful![/]")
-        
+
         if not Confirm.ask("\n[yellow]Proceed with these settings?[/]"):
             if not Confirm.ask("[yellow]Would you like to try different settings?[/]"):
                 console.print("[red]Migration cancelled by user[/]")
                 sys.exit(0)
             console.print("\n")  # Add spacing before retry
             continue
-        
+
         return config
 
 def get_batch_config() -> int:
     """Interactive configuration for batch size"""
     console.print(Panel("Batch Size Configuration", style="cyan"))
-    
+
     console.print("[cyan]The batch size determines how many records are processed at once.[/]")
     console.print("[cyan]A larger batch size may be faster but uses more memory.[/]")
     console.print("[cyan]Recommended range: 100-5000[/]\n")
-    
+
     while True:
         batch_size = IntPrompt.ask(
             "[cyan]Batch size[/]",
             default=500
         )
-        
+
         if batch_size < 1:
             console.print("[red]Batch size must be at least 1[/]")
             continue
-            
+
         if batch_size > 10000:
             if not Confirm.ask("[yellow]Large batch sizes may cause memory issues. Continue anyway?[/]"):
                 continue
-        
+
         return batch_size
 
 def check_sqlite_integrity(db_path: Path) -> bool:
     """Run integrity check on SQLite database"""
     console.print(Panel("Running SQLite Database Integrity Check", style="cyan"))
-    
+
     try:
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
-            
+
             checks = [
                 ("Integrity Check", "PRAGMA integrity_check"),
                 ("Quick Check", "PRAGMA quick_check"),
                 ("Foreign Key Check", "PRAGMA foreign_key_check")
             ]
-            
+
             table = Table(show_header=True)
             table.add_column("Check Type", style="cyan")
             table.add_column("Status", style="green")
-            
+
             for check_name, query in checks:
                 cursor.execute(query)
                 result = cursor.fetchall()
                 status = "✅ Passed" if (result == [('ok',)] or not result) else "❌ Failed"
                 table.add_row(check_name, status)
-                
+
                 if status == "❌ Failed":
                     console.print(f"[red]Failed {check_name}:[/] {result}")
                     return False
-            
+
             try:
                 cursor.execute("SELECT COUNT(*) FROM sqlite_master;")
                 cursor.fetchone()
             except sqlite3.DatabaseError as e:
                 console.print(f"[bold red]Database appears to be corrupted:[/] {e}")
                 return False
-            
+
             console.print(table)
             return True
-            
+
     except Exception as e:
         console.print(f"[bold red]Error during integrity check:[/] {str(e)}")
         return False
@@ -233,7 +233,7 @@ def get_pg_safe_identifier(identifier: str) -> str:
 async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
     sqlite_conn = None
     pg_conn = None
-    
+
     try:
         # Try SQLite connection first
         try:
@@ -243,7 +243,7 @@ async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
         except sqlite3.Error as e:
             console.print(f"[bold red]Failed to connect to SQLite database:[/] {str(e)}")
             raise
-        
+
         # Try PostgreSQL connection
         try:
             pg_conn = psycopg.connect(**pg_config)
@@ -252,16 +252,16 @@ async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
             if sqlite_conn:
                 sqlite_conn.close()
             raise
-        
+
         yield sqlite_conn, pg_conn
-        
+
     finally:
         if sqlite_conn:
             try:
                 sqlite_conn.close()
             except sqlite3.Error:
                 pass
-                
+
         if pg_conn:
             try:
                 pg_conn.close()
@@ -277,7 +277,7 @@ async def process_table(
 ) -> None:
     pg_safe_table_name = get_pg_safe_identifier(table_name)
     sqlite_safe_table_name = get_sqlite_safe_identifier(table_name)
-    
+
     task_id = progress.add_task(
         f"Migrating {table_name}...",
         total=100,
@@ -318,7 +318,7 @@ async def process_table(
 
         # Create table if it doesn't exist
         if not pg_column_types:
-            columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2])}" 
+            columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2])}"
                       for col in schema]
             create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
             pg_cursor.execute(create_query)
@@ -336,7 +336,7 @@ async def process_table(
                     f"SELECT * FROM {sqlite_safe_table_name} LIMIT {batch_size} OFFSET {processed_rows}"
                 )
                 raw_rows = sqlite_cursor.fetchall()
-                
+
                 if not raw_rows:
                     break
 
@@ -365,7 +365,7 @@ async def process_table(
                         for i, value in enumerate(row):
                             col_name = schema[i][1]
                             col_type = pg_column_types.get(col_name)
-                            
+
                             if value is None:
                                 values.append('NULL')
                             elif col_type == 'boolean':
@@ -378,8 +378,8 @@ async def process_table(
                                 values.append(str(value))
 
                         insert_query = f"""
-                            INSERT INTO {pg_safe_table_name} 
-                            ({', '.join(col_names)}) 
+                            INSERT INTO {pg_safe_table_name}
+                            ({', '.join(col_names)})
                             VALUES ({', '.join(values)})
                         """
                         pg_cursor.execute(insert_query)
@@ -415,26 +415,26 @@ async def process_table(
 async def migrate() -> None:
     # Get SQLite database path
     sqlite_path = get_sqlite_config()
-    
+
     if not check_sqlite_integrity(sqlite_path):
         console.print("[bold red]Aborting migration due to database integrity issues[/]")
         sys.exit(1)
 
     # Get PostgreSQL configuration
     pg_config = get_pg_config()
-    
+
     # Get batch size configuration
     batch_size = get_batch_config()
-    
+
     console.print(Panel("Starting Migration Process", style="cyan"))
-    
+
     async with async_db_connections(sqlite_path, pg_config) as (sqlite_conn, pg_conn):
         sqlite_cursor = sqlite_conn.cursor()
         pg_cursor = pg_conn.cursor()
-        
+
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         tables = sqlite_cursor.fetchall()
-        
+
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -445,17 +445,17 @@ async def migrate() -> None:
                 for (table_name,) in tables:
                     if table_name in ("migratehistory", "alembic_version"):
                         continue
-                    
+
                     await process_table(
-                        table_name, 
-                        sqlite_cursor, 
-                        pg_cursor, 
+                        table_name,
+                        sqlite_cursor,
+                        pg_cursor,
                         progress,
                         batch_size
                     )
-                    
+
                 console.print(Panel("Migration Complete!", style="green"))
-                
+
             except Exception as e:
                 console.print(f"[bold red]Critical error during migration:[/] {e}")
                 console.print("[red]Stack trace:[/]")
