@@ -6,6 +6,7 @@ from rich.console import Console
 from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn
 from rich.panel import Panel
 from rich.table import Table
+from rich.prompt import Prompt, IntPrompt, Confirm
 from pathlib import Path
 from typing import Dict, List, Tuple, Any, Optional
 import asyncio
@@ -18,13 +19,60 @@ SQLITE_DB_PATH = Path('webui.db')
 BATCH_SIZE = 500
 MAX_RETRIES = 3
 
-PG_CONFIG: Dict[str, Any] = {
-    'host': 'yourhostname',
-    'port': 5432,
-    'dbname': 'your_db_name',
-    'user': 'your_username',
-    'password': 'your_password'
-}
+def get_pg_config() -> Dict[str, Any]:
+    """Interactive configuration for PostgreSQL connection"""
+    console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
+    
+    config = {}
+    
+    # Default values
+    defaults = {
+        'host': 'localhost',
+        'port': 5432,
+        'dbname': 'postgres',
+        'user': 'postgres',
+    }
+    
+    config['host'] = Prompt.ask(
+        "[cyan]PostgreSQL host[/]",
+        default=defaults['host']
+    )
+    
+    config['port'] = IntPrompt.ask(
+        "[cyan]PostgreSQL port[/]",
+        default=defaults['port']
+    )
+    
+    config['dbname'] = Prompt.ask(
+        "[cyan]Database name[/]",
+        default=defaults['dbname']
+    )
+    
+    config['user'] = Prompt.ask(
+        "[cyan]Username[/]",
+        default=defaults['user']
+    )
+    
+    config['password'] = Prompt.ask(
+        "[cyan]Password[/]",
+        password=True
+    )
+    
+    # Show summary
+    summary = Table(show_header=False, box=None)
+    for key, value in config.items():
+        if key != 'password':
+            summary.add_row(f"[cyan]{key}:[/]", str(value))
+    summary.add_row("[cyan]password:[/]", "********")
+    
+    console.print("\nConnection Details:")
+    console.print(summary)
+    
+    if not Confirm.ask("\n[yellow]Proceed with these settings?[/]"):
+        console.print("[red]Migration cancelled by user[/]")
+        sys.exit(0)
+    
+    return config
 
 def check_sqlite_integrity() -> bool:
     """Run integrity check on SQLite database"""
@@ -87,12 +135,12 @@ def get_pg_safe_identifier(identifier: str) -> str:
     return f'"{identifier}"' if identifier.lower() in reserved_keywords else identifier
 
 @asynccontextmanager
-async def async_db_connections():
+async def async_db_connections(pg_config: Dict[str, Any]):
     sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=60)
     sqlite_conn.execute('PRAGMA journal_mode=WAL')
     sqlite_conn.execute('PRAGMA synchronous=NORMAL')
     
-    pg_conn = psycopg.connect(**PG_CONFIG)
+    pg_conn = psycopg.connect(**pg_config)
     
     try:
         yield sqlite_conn, pg_conn
@@ -250,7 +298,10 @@ async def migrate() -> None:
 
     console.print(Panel("Starting Migration Process", style="cyan"))
     
-    async with async_db_connections() as (sqlite_conn, pg_conn):
+    # Get PostgreSQL configuration
+    pg_config = get_pg_config()
+    
+    async with async_db_connections(pg_config) as (sqlite_conn, pg_conn):
         sqlite_cursor = sqlite_conn.cursor()
         pg_cursor = pg_conn.cursor()
         
