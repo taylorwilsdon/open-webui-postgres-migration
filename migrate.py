@@ -19,60 +19,100 @@ SQLITE_DB_PATH = Path('webui.db')
 BATCH_SIZE = 500
 MAX_RETRIES = 3
 
+def test_pg_connection(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
+    """Test PostgreSQL connection and return (success, error_message)"""
+    try:
+        with psycopg.connect(**config, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+        return True, None
+    except psycopg.OperationalError as e:
+        error_msg = str(e).strip()
+        if "role" in error_msg and "does not exist" in error_msg:
+            return False, f"Authentication failed: The user '{config['user']}' does not exist in PostgreSQL"
+        elif "password" in error_msg:
+            return False, "Authentication failed: Invalid password"
+        elif "connection failed" in error_msg:
+            return False, f"Connection failed: Could not connect to PostgreSQL at {config['host']}:{config['port']}"
+        else:
+            return False, f"Database error: {error_msg}"
+    except Exception as e:
+        return False, f"Unexpected error: {str(e)}"
+
 def get_pg_config() -> Dict[str, Any]:
     """Interactive configuration for PostgreSQL connection"""
-    console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
-    
-    config = {}
-    
-    # Default values
-    defaults = {
-        'host': 'localhost',
-        'port': 5432,
-        'dbname': 'postgres',
-        'user': 'postgres',
-    }
-    
-    config['host'] = Prompt.ask(
-        "[cyan]PostgreSQL host[/]",
-        default=defaults['host']
-    )
-    
-    config['port'] = IntPrompt.ask(
-        "[cyan]PostgreSQL port[/]",
-        default=defaults['port']
-    )
-    
-    config['dbname'] = Prompt.ask(
-        "[cyan]Database name[/]",
-        default=defaults['dbname']
-    )
-    
-    config['user'] = Prompt.ask(
-        "[cyan]Username[/]",
-        default=defaults['user']
-    )
-    
-    config['password'] = Prompt.ask(
-        "[cyan]Password[/]",
-        password=True
-    )
-    
-    # Show summary
-    summary = Table(show_header=False, box=None)
-    for key, value in config.items():
-        if key != 'password':
-            summary.add_row(f"[cyan]{key}:[/]", str(value))
-    summary.add_row("[cyan]password:[/]", "********")
-    
-    console.print("\nConnection Details:")
-    console.print(summary)
-    
-    if not Confirm.ask("\n[yellow]Proceed with these settings?[/]"):
-        console.print("[red]Migration cancelled by user[/]")
-        sys.exit(0)
-    
-    return config
+    while True:
+        console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
+        
+        config = {}
+        
+        # Default values
+        defaults = {
+            'host': 'localhost',
+            'port': 5432,
+            'dbname': 'postgres',
+            'user': 'postgres',
+        }
+        
+        config['host'] = Prompt.ask(
+            "[cyan]PostgreSQL host[/]",
+            default=defaults['host']
+        )
+        
+        config['port'] = IntPrompt.ask(
+            "[cyan]PostgreSQL port[/]",
+            default=defaults['port']
+        )
+        
+        config['dbname'] = Prompt.ask(
+            "[cyan]Database name[/]",
+            default=defaults['dbname']
+        )
+        
+        config['user'] = Prompt.ask(
+            "[cyan]Username[/]",
+            default=defaults['user']
+        )
+        
+        config['password'] = Prompt.ask(
+            "[cyan]Password[/]",
+            password=True
+        )
+        
+        # Show summary
+        summary = Table(show_header=False, box=None)
+        for key, value in config.items():
+            if key != 'password':
+                summary.add_row(f"[cyan]{key}:[/]", str(value))
+        summary.add_row("[cyan]password:[/]", "********")
+        
+        console.print("\nConnection Details:")
+        console.print(summary)
+        
+        # Test connection
+        with console.status("[cyan]Testing database connection...[/]"):
+            success, error_msg = test_pg_connection(config)
+        
+        if not success:
+            console.print(f"\n[red]Connection Error: {error_msg}[/]")
+            
+            if not Confirm.ask("\n[yellow]Would you like to try again?[/]"):
+                console.print("[red]Migration cancelled by user[/]")
+                sys.exit(0)
+            
+            console.print("\n")  # Add spacing before retry
+            continue
+        
+        console.print("\n[green]✓ Database connection successful![/]")
+        
+        if not Confirm.ask("\n[yellow]Proceed with these settings?[/]"):
+            if not Confirm.ask("[yellow]Would you like to try different settings?[/]"):
+                console.print("[red]Migration cancelled by user[/]")
+                sys.exit(0)
+            console.print("\n")  # Add spacing before retry
+            continue
+        
+        return config
 
 def check_sqlite_integrity() -> bool:
     """Run integrity check on SQLite database"""
@@ -136,17 +176,42 @@ def get_pg_safe_identifier(identifier: str) -> str:
 
 @asynccontextmanager
 async def async_db_connections(pg_config: Dict[str, Any]):
-    sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=60)
-    sqlite_conn.execute('PRAGMA journal_mode=WAL')
-    sqlite_conn.execute('PRAGMA synchronous=NORMAL')
-    
-    pg_conn = psycopg.connect(**pg_config)
+    sqlite_conn = None
+    pg_conn = None
     
     try:
+        # Try SQLite connection first
+        try:
+            sqlite_conn = sqlite3.connect(SQLITE_DB_PATH, timeout=60)
+            sqlite_conn.execute('PRAGMA journal_mode=WAL')
+            sqlite_conn.execute('PRAGMA synchronous=NORMAL')
+        except sqlite3.Error as e:
+            console.print(f"[bold red]Failed to connect to SQLite database:[/] {str(e)}")
+            raise
+        
+        # Try PostgreSQL connection
+        try:
+            pg_conn = psycopg.connect(**pg_config)
+        except psycopg.OperationalError as e:
+            console.print(f"[bold red]Failed to connect to PostgreSQL database:[/] {str(e)}")
+            if sqlite_conn:
+                sqlite_conn.close()
+            raise
+        
         yield sqlite_conn, pg_conn
+        
     finally:
-        sqlite_conn.close()
-        pg_conn.close()
+        if sqlite_conn:
+            try:
+                sqlite_conn.close()
+            except sqlite3.Error:
+                pass
+                
+        if pg_conn:
+            try:
+                pg_conn.close()
+            except psycopg.Error:
+                pass
 
 async def process_table(
     table_name: str,
