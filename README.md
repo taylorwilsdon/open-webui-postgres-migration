@@ -2,7 +2,8 @@
 
 A robust, interactive tool for migrating Open WebUI databases from SQLite to PostgreSQL. Designed for reliability and ease of use.
 
-![Migration Demo](https://github.com/user-attachments/assets/a8011ef4-f622-4af4-aa1a-c212d1f4f899)
+![Migration Demo](https://github.com/user-attachments/assets/f060405a-c7d7-4383-8c86-327fda7fbf2b)
+https://github.com/user-attachments/assets/f060405a-c7d7-4383-8c86-327fda7fbf2b
 
 ## ✨ Features
 
