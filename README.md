@@ -38,6 +38,27 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
    python migrate.py
    ```
 
+## 📝 Best Practices
+
+1. **Before Migration:**
+   - Backup your SQLite database
+   - **Start Open-WebUI with `DATABASE_URL` configured pointing to the new PostgreSQL instance**
+       - This is very important - you need to let Open-WebUI bootstrap the new DB before running the migration.
+       - DATABASE_URL is formatted as `postgresql://user:password@host:port/dbname`
+   - Verify PostgreSQL server access from host running script
+   - Check available disk space
+
+2. **During Migration:**
+   - Don't interrupt the process
+   - Monitor system resources
+   - Keep network connection stable
+
+3. **After Migration:**
+   - Verify data integrity
+   - Test application functionality
+   - Keep SQLite backup until verified
+
+
 ## 🔧 Configuration Options
 
 During the migration, you'll be prompted to configure:
@@ -82,22 +103,6 @@ Common issues and solutions:
 | Memory Errors | Reduce batch size in configuration |
 | Encoding Issues | Ensure proper database character encoding |
 
-## 📝 Best Practices
-
-1. **Before Migration:**
-   - Backup your SQLite database
-   - Verify PostgreSQL server access
-   - Check available disk space
-
-2. **During Migration:**
-   - Don't interrupt the process
-   - Monitor system resources
-   - Keep network connection stable
-
-3. **After Migration:**
-   - Verify data integrity
-   - Test application functionality
-   - Keep SQLite backup until verified
 
 ## 🤝 Contributing
 
