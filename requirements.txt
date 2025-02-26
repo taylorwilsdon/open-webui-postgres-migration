@@ -1,6 +1,6 @@
 markdown-it-py==3.0.0
 mdurl==0.1.2
-psycopg==3.2.3
+psycopg[binary]==3.2.3
 Pygments==2.19.1
 rich==13.9.4
 typing_extensions==4.12.2
