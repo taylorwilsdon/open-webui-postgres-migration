@@ -291,6 +291,7 @@ async def process_table(
             pg_cursor.connection.commit()
         except psycopg.Error as e:
             console.print(f"[yellow]Note: Table {table_name} does not exist yet or could not be truncated: {e}[/]")
+            pg_cursor.connection.rollback()
 
         # Get PostgreSQL column types
         try:
@@ -300,7 +301,9 @@ async def process_table(
                 WHERE table_name = %s
             """, (table_name,))
             pg_column_types = dict(pg_cursor.fetchall())
+            pg_cursor.connection.commit()
         except psycopg.Error:
+            pg_cursor.connection.rollback()
             pg_column_types = {}
 
         # Get SQLite schema
@@ -318,11 +321,16 @@ async def process_table(
 
         # Create table if it doesn't exist
         if not pg_column_types:
-            columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2])}"
-                      for col in schema]
-            create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
-            pg_cursor.execute(create_query)
-            pg_cursor.connection.commit()
+            try:
+                columns = [f"{get_pg_safe_identifier(col[1])} {sqlite_to_pg_type(col[2])}"
+                          for col in schema]
+                create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
+                pg_cursor.execute(create_query)
+                pg_cursor.connection.commit()
+            except psycopg.Error as e:
+                console.print(f"[red]Error creating table {table_name}: {e}[/]")
+                pg_cursor.connection.rollback()
+                raise
 
         # Process rows
         sqlite_cursor.execute(f"SELECT COUNT(*) FROM {sqlite_safe_table_name}")
@@ -409,6 +417,7 @@ async def process_table(
             console.print(f"[yellow]Failed to migrate {len(failed_rows)} rows from {table_name}[/]")
 
     except Exception as e:
+        pg_cursor.connection.rollback()
         console.print(f"[bold red]Error processing table {table_name}:[/] {str(e)}")
         raise
 
