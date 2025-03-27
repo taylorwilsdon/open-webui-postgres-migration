@@ -22,7 +22,7 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 
 1. **Clone the repository:**
    ```bash
-   git clone https://github.com/yourusername/open-webui-postgres-migration.git
+   git clone https://github.com/taylorwilsdon/open-webui-postgres-migration.git
    cd open-webui-postgres-migration
    ```
 
