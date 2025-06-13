@@ -11,7 +11,8 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 ## ✨ Features
 
 - 🖥️ Interactive command-line interface with clear prompts
-- 🔍 Comprehensive database integrity checking
+- � **Environment file support for automated deployments**
+- �🔍 Comprehensive database integrity checking
 - 📦 Configurable batch processing for optimal performance
 - ⚡ Real-time progress visualization
 - 🛡️ Robust error handling and recovery
@@ -37,6 +38,11 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
    ```bash
    python migrate.py
    ```
+   
+   **Or use environment file for automation:**
+   ```bash
+   python migrate.py --env-file .env
+   ```
 
 ## 📝 Best Practices
 
@@ -61,6 +67,9 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 
 ## 🔧 Configuration Options
 
+The migration tool supports two configuration methods:
+
+### Interactive Mode (Default)
 During the migration, you'll be prompted to configure:
 
 - **SQLite Database**
@@ -77,12 +86,39 @@ During the migration, you'll be prompted to configure:
   - Batch size (100-5000 recommended)
   - Automatic memory usage warnings
 
+### Environment File Mode (--env-file)
+For automated deployments, create a `.env` file with your configuration:
+
+```bash
+# SQLite Configuration
+SQLITE_DB_PATH=./data/webui.db
+
+# PostgreSQL Configuration
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=openwebui
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=mypassword
+```
+
+**Alternative PostgreSQL variable names are supported:**
+- `PG_HOST`, `PG_PORT`, `PG_DATABASE`, `PG_USER`, `PG_PASSWORD`
+
+**Run with environment file:**
+```bash
+python migrate.py --env-file .env
+```
+
 ## ⚙️ System Requirements
 
 - Python 3.8+
 - PostgreSQL server (running and accessible)
 - Sufficient disk space for both databases
 - Network access to PostgreSQL server
+
+**Dependencies:**
+- `psycopg2` 2.9.10+ (PostgreSQL adapter)
+- `rich` 14.0.0+ (enhanced CLI interface)
 
 ## 🛡️ Safety Features
 
@@ -102,6 +138,7 @@ Common issues and solutions:
 | Permission Denied | Verify PostgreSQL user privileges |
 | Memory Errors | Reduce batch size in configuration |
 | Encoding Issues | Ensure proper database character encoding |
+| Environment File Not Found | Verify `.env` file path and format (KEY=VALUE) |
 
 
 ## 🤝 Contributing
