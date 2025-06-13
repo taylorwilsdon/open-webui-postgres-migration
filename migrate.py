@@ -733,7 +733,7 @@ Example .env file:
     )
 
     parser.add_argument(
-        "--envfile",
+        "--env-file",
         type=Path,
         help="Path to environment file containing database connection settings",
     )
