@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "open-webui-postgres-migration"
-version = "1.0.1"
+version = "1.0.2"
 description = "A robust, interactive tool for migrating Open WebUI databases from SQLite to PostgreSQL"
 readme = "README.md"
 license = {file = "LICENSE"}
