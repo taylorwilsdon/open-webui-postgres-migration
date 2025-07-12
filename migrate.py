@@ -613,7 +613,7 @@ def load_env_file(env_file_path: Path) -> Dict[str, str]:
         sys.exit(1)
 
     try:
-        with open(env_file_path, "r") as f:
+        with open(env_file_path, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, 1):
                 line = line.strip()
 
