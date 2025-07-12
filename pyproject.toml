@@ -28,7 +28,7 @@ classifiers = [
     "Topic :: System :: Systems Administration",
 ]
 keywords = ["database", "migration", "postgresql", "sqlite", "open-webui"]
-requires-python = ">=3.8"
+requires-python = ">=3.8.1"
 dependencies = [
     "psycopg[binary]==3.2.3",
     "rich==13.9.4",
