@@ -45,6 +45,7 @@ Issues = "https://github.com/taylorwilsdon/open-webui-postgres-migration/issues"
 
 [project.scripts]
 open-webui-migrate = "migrate:main"
+open-webui-postgres-migration = "migrate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]

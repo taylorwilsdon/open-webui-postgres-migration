@@ -20,6 +20,15 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 
 ## 🚀 Quick Start
 
+### Easy Installation with uvx (Recommended)
+
+Run directly without installation:
+```bash
+uvx open-webui-postgres-migration
+```
+
+### Manual Installation
+
 1. **Clone the repository:**
    ```bash
    git clone https://github.com/taylorwilsdon/open-webui-postgres-migration.git
