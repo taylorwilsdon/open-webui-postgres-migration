@@ -748,9 +748,9 @@ def main():
     env_sqlite_path = None
     env_pg_config = None
 
-    if args.envfile:
+    if args.env_file:
         # Load configuration from environment file
-        env_vars = load_env_file(args.envfile)
+        env_vars = load_env_file(args.env_file)
         env_sqlite_path, env_pg_config = get_config_from_env(env_vars)
 
     # Run the migration
