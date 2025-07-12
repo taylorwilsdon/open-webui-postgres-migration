@@ -1,0 +1,84 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "open-webui-postgres-migration"
+version = "1.0.1"
+description = "A robust, interactive tool for migrating Open WebUI databases from SQLite to PostgreSQL"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [
+    {name = "Taylor Wilsdon", email = "taylor@example.com"}
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: System :: Systems Administration",
+]
+keywords = ["database", "migration", "postgresql", "sqlite", "open-webui"]
+requires-python = ">=3.8"
+dependencies = [
+    "psycopg[binary]==3.2.3",
+    "rich==13.9.4",
+    "markdown-it-py==3.0.0",
+    "mdurl==0.1.2",
+    "Pygments==2.19.1",
+    "typing_extensions==4.12.2",
+]
+
+[project.urls]
+Homepage = "https://github.com/taylorwilsdon/open-webui-postgres-migration"
+Repository = "https://github.com/taylorwilsdon/open-webui-postgres-migration"
+Issues = "https://github.com/taylorwilsdon/open-webui-postgres-migration/issues"
+
+[project.scripts]
+open-webui-migrate = "migrate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["."]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "migrate.py",
+    "README.md",
+    "LICENSE",
+    "requirements.txt",
+]
+
+[tool.uv]
+dev-dependencies = [
+    "build>=1.0.0",
+    "twine>=4.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[tool.black]
+line-length = 88
+target-version = ['py38']
+
+[tool.mypy]
+python_version = "3.8"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "--cov=migrate --cov-report=term-missing"
