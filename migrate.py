@@ -70,6 +70,28 @@ def test_pg_connection(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
     except Exception as e:
         return False, f"Unexpected error: {str(e)}"
 
+def check_postgres_tables_exist(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
+    """Check if PostgreSQL database has been bootstrapped with Open WebUI tables"""
+    try:
+        with psycopg.connect(**config, connect_timeout=5) as conn:
+            with conn.cursor() as cur:
+                # Check for common Open WebUI tables
+                expected_tables = ['user', 'auth', 'chat', 'document', 'model', 'prompt', 'function', 'tool']
+
+                cur.execute("""
+                    SELECT table_name
+                    FROM information_schema.tables
+                    WHERE table_schema = 'public'
+                    AND table_type = 'BASE TABLE'
+                """)
+                existing_tables = [row[0] for row in cur.fetchall()]
+
+                missing_tables = [table for table in expected_tables if table not in existing_tables]
+
+                return len(missing_tables) == 0, missing_tables
+    except Exception as e:
+        return False, [f"Error checking tables: {str(e)}"]
+
 def get_pg_config() -> Dict[str, Any]:
     """Interactive configuration for PostgreSQL connection"""
     while True:
@@ -135,6 +157,27 @@ def get_pg_config() -> Dict[str, Any]:
             continue
 
         console.print("\n[green]✓ Database connection successful![/]")
+
+        # Check if PostgreSQL tables exist (Open WebUI bootstrap verification)
+        with console.status("[cyan]Checking if PostgreSQL database has been bootstrapped...[/]"):
+            tables_exist, missing_tables = check_postgres_tables_exist(config)
+
+        if not tables_exist:
+            console.print(f"\n[red]❌ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]")
+            console.print(f"[yellow]Missing tables: {', '.join(missing_tables)}[/]")
+            console.print("\n[yellow]Before running this migration, you must:[/]")
+            console.print("1. Set DATABASE_URL environment variable: DATABASE_URL=\"postgresql://user:password@host:port/dbname\"")
+            console.print("2. Start Open WebUI to create the database tables")
+            console.print("3. Stop Open WebUI after confirming tables are created")
+            console.print("4. Then run this migration script")
+
+            if not Confirm.ask("\n[yellow]Have you completed these steps and want to check again?[/]"):
+                console.print("[red]Migration cancelled. Please bootstrap PostgreSQL database first.[/]")
+                sys.exit(0)
+            console.print("\n")  # Add spacing before retry
+            continue
+
+        console.print("\n[green]✓ PostgreSQL database has been properly bootstrapped![/]")
 
         if not Confirm.ask("\n[yellow]Proceed with these settings?[/]"):
             if not Confirm.ask("[yellow]Would you like to try different settings?[/]"):

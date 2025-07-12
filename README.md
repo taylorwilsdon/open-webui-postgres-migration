@@ -42,9 +42,13 @@ https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 
 1. **Before Migration:**
    - Backup your SQLite database
-   - **Start Open-WebUI with `DATABASE_URL` configured pointing to the new PostgreSQL instance**
-       - This is very important - you need to let Open-WebUI bootstrap the new DB before running the migration.
-       - DATABASE_URL is formatted as `postgresql://user:password@host:port/dbname`
+   - **CRITICAL: Set up PostgreSQL database and tables FIRST**
+       - Set the `DATABASE_URL` environment variable: `DATABASE_URL="postgresql://user:password@host:port/dbname"`
+       - `export DATABASE_URL="postgresql://user:password@host:port/dbname"` for macOS / Linux
+       - `set DATABASE_URL="postgresql://user:password@host:port/dbname"` for windows
+       - Start Open WebUI with the PostgreSQL `DATABASE_URL` configured to create the database tables
+       - Stop Open WebUI after confirming tables are created
+       - **The migration script will verify this step was completed before proceeding**
    - Verify PostgreSQL server access from host running script
    - Check available disk space
 
