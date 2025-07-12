@@ -546,5 +546,8 @@ async def migrate() -> None:
                 pg_conn.rollback()
                 sys.exit(1)
 
-if __name__ == "__main__":
+def main():
     asyncio.run(migrate())
+
+if __name__ == "__main__":
+    main()
