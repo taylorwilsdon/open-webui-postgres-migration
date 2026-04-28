@@ -421,6 +421,7 @@ async def process_table(
                     rows.append(tuple(cleaned_row))
 
                 for row_index, row in enumerate(rows):
+                    pg_cursor.execute("SAVEPOINT row_sp")
                     try:
                         if is_group_table:
                             console.print(f"[cyan]Processing group row {processed_rows + row_index}[/]")
@@ -460,7 +461,9 @@ async def process_table(
                         if is_group_table:
                             console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
+                        pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
                         if is_group_table:
                             console.print(f"[red]Error processing group row {processed_rows + row_index}:[/]")
                             console.print(f"[red]Row data:[/] {row}")
@@ -495,6 +498,33 @@ async def process_table(
         console.print(f"[bold red]Error processing table {table_name}:[/] {str(e)}")
         raise
 
+def sort_tables_by_fk_dependency(pg_cursor: psycopg.Cursor, table_names: List[str]) -> List[str]:
+    """Return table_names ordered so that FK parents come before children."""
+    pg_cursor.execute("""
+        SELECT tc.table_name, ccu.table_name
+        FROM information_schema.table_constraints tc
+        JOIN information_schema.constraint_column_usage ccu
+          ON tc.constraint_name = ccu.constraint_name
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+          AND tc.table_name <> ccu.table_name
+    """)
+    parents: Dict[str, set] = {}
+    for child, parent in pg_cursor.fetchall():
+        parents.setdefault(child, set()).add(parent)
+    pg_cursor.connection.commit()
+
+    remaining = set(table_names)
+    ordered: List[str] = []
+    while remaining:
+        ready = sorted(t for t in remaining if not (parents.get(t, set()) & remaining))
+        if not ready:
+            ordered.extend(sorted(remaining))
+            break
+        ordered.extend(ready)
+        remaining.difference_update(ready)
+    return ordered
+
 async def migrate() -> None:
     # Get SQLite database path
     sqlite_path = get_sqlite_config()
@@ -516,7 +546,9 @@ async def migrate() -> None:
         pg_cursor = pg_conn.cursor()
 
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = sqlite_cursor.fetchall()
+        table_names = [t[0] for t in sqlite_cursor.fetchall()
+                       if t[0] not in ("migratehistory", "alembic_version")]
+        tables = sort_tables_by_fk_dependency(pg_cursor, table_names)
 
         with Progress(
             SpinnerColumn(),
@@ -525,10 +557,7 @@ async def migrate() -> None:
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             try:
-                for (table_name,) in tables:
-                    if table_name in ("migratehistory", "alembic_version"):
-                        continue
-
+                for table_name in tables:
                     await process_table(
                         table_name,
                         sqlite_cursor,
