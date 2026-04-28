@@ -1,17 +1,19 @@
-import psycopg
-import traceback
-import sys
-import sqlite3
-from dataclasses import dataclass, field
-from rich.console import Console
-from rich.progress import Progress, TextColumn, BarColumn, SpinnerColumn
-from rich.panel import Panel
-from rich.table import Table
-from rich.prompt import Prompt, IntPrompt, Confirm
-from pathlib import Path
-from typing import Dict, List, Tuple, Any, Optional
 import asyncio
+import json
+import sqlite3
+import sys
+import traceback
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.prompt import Confirm, IntPrompt, Prompt
+from rich.table import Table
 
 console = Console()
 
@@ -309,8 +311,8 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                         classify_sqlite_foreign_key_violations(result)
                     )
                     if unknown_violations:
-                        status = "❌ Failed"
-                        table.add_row(check_name, status)
+                        table.add_row(check_name, "❌ Failed")
+                        console.print(table)
                         console.print(
                             f"[red]Failed {check_name}:[/] {unknown_violations}"
                         )
@@ -320,18 +322,10 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                     total_skipped = sum(
                         len(rowids) for rowids in skipped_rowids.values()
                     )
-                    status = f"⚠️ {total_skipped} orphaned rows will be skipped"
-                    table.add_row(check_name, status)
-
-                    console.print(
-                        "[yellow]Foreign key check found orphaned Open WebUI "
-                        "attachment rows. These rows reference deleted chats or "
-                        "knowledge bases and will be skipped during migration.[/]"
+                    table.add_row(
+                        check_name,
+                        f"⚠️ {total_skipped} orphaned rows will be skipped",
                     )
-                    for table_name, rowids in skipped_rowids.items():
-                        console.print(
-                            f"[yellow]- {table_name}: {len(rowids)} row(s)[/]"
-                        )
                     continue
 
                 status = (
@@ -340,6 +334,7 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                 table.add_row(check_name, status)
 
                 if status == "❌ Failed":
+                    console.print(table)
                     console.print(f"[red]Failed {check_name}:[/] {result}")
                     return SQLiteIntegrityReport(False)
 
@@ -351,16 +346,23 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                 return SQLiteIntegrityReport(False)
 
             console.print(table)
+
+            if skipped_foreign_key_rowids:
+                console.print(
+                    "[yellow]Foreign key check found orphaned Open WebUI "
+                    "attachment rows. These rows reference deleted chats or "
+                    "knowledge bases and will be skipped during migration.[/]"
+                )
+                for table_name, rowids in skipped_foreign_key_rowids.items():
+                    console.print(
+                        f"[yellow]- {table_name}: {len(rowids)} row(s)[/]"
+                    )
+
             return SQLiteIntegrityReport(True, skipped_foreign_key_rowids)
 
     except Exception as e:
         console.print(f"[bold red]Error during integrity check:[/] {str(e)}")
         return SQLiteIntegrityReport(False)
-
-
-def check_sqlite_integrity(db_path: Path) -> bool:
-    """Run integrity check on SQLite database."""
-    return get_sqlite_integrity_report(db_path).passed
 
 
 def sqlite_to_pg_type(sqlite_type: str, column_name: str) -> str:
@@ -558,7 +560,7 @@ async def process_table(
                                 cleaned_row.append(
                                     item.decode("utf-8", errors="replace")
                                 )
-                            except:
+                            except Exception:
                                 cleaned_row.append(
                                     item.decode("latin1", errors="replace")
                                 )
@@ -569,7 +571,7 @@ async def process_table(
                                         "utf-8"
                                     )
                                 )
-                            except:
+                            except Exception:
                                 cleaned_row.append(
                                     item.encode("latin1", errors="replace").decode(
                                         "latin1"
@@ -599,9 +601,6 @@ async def process_table(
                                 # Check if this is a JSON column
                                 if col_type == "jsonb":
                                     try:
-                                        # Try to parse as JSON to validate
-                                        import json
-
                                         json.loads(value)
                                         values.append(f"'{value}'::jsonb")
                                     except json.JSONDecodeError as e:
