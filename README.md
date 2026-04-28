@@ -115,6 +115,7 @@ Common issues and solutions:
 | Permission Denied | Verify PostgreSQL user privileges |
 | Memory Errors | Reduce batch size in configuration |
 | Encoding Issues | Ensure proper database character encoding |
+| `Failed Foreign Key Check` for `chat_file` or `knowledge_file` | The migration skips orphaned attachment rows that reference deleted chats or knowledge bases and reports how many rows were skipped |
 
 
 ## 🤝 Contributing
