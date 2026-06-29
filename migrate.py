@@ -24,6 +24,62 @@ IGNORABLE_SQLITE_FOREIGN_KEY_VIOLATIONS = {
     ("knowledge_file", "knowledge"),
 }
 
+# Migration priority: lower number = migrated first
+# Ensures parent tables are migrated before child tables with FK references
+TABLE_MIGRATION_PRIORITY: Dict[str, int] = {
+    "auth": 10,
+    "user": 20,
+    "config": 25,
+    "model": 30,
+    "function": 35,
+    "tool": 40,
+    "prompt": 45,
+    "skill": 50,
+    "channel": 55,
+    "group": 60,
+    "chat": 70,
+    "knowledge": 75,
+    "folder": 80,
+    "file": 85,
+    "memory": 90,
+    "chatidtag": 95,
+    "tag": 96,
+    "feedback": 97,
+    "message": 98,
+    "message_reaction": 99,
+    "channel_member": 100,
+    "channel_file": 101,
+    "channel_webhook": 102,
+    "chat_file": 110,
+    "chat_message": 111,
+    "shared_chat": 112,
+    "oauth_session": 120,
+    "api_key": 125,
+    "group_member": 130,
+    "document": 140,
+    "prompt_history": 145,
+    "access_grant": 150,
+    "knowledge_directory": 155,
+    "knowledge_file": 160,
+    "automation": 170,
+    "automation_run": 175,
+    "calendar": 180,
+    "calendar_event": 185,
+    "calendar_event_attendee": 190,
+    "pinned_note": 195,
+    "note": 200,
+}
+
+
+def resolve_migration_order(
+    sqlite_tables: List[str],
+) -> List[str]:
+    """Return tables sorted by TABLE_MIGRATION_PRIORITY."""
+    return sorted(
+        [t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")],
+        key=lambda t: TABLE_MIGRATION_PRIORITY.get(t, 9999),
+    )
+
 
 @dataclass
 class SQLiteIntegrityReport:
@@ -693,7 +749,15 @@ async def migrate() -> None:
         pg_cursor = pg_conn.cursor()
 
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = sqlite_cursor.fetchall()
+        sqlite_table_names = [row[0] for row in sqlite_cursor.fetchall()]
+
+        # Sort tables by priority to ensure FK dependencies are resolved
+        migration_order = resolve_migration_order(sqlite_table_names)
+
+        console.print("\n[cyan]Migration order (by priority):[/]")
+        for idx, tname in enumerate(migration_order, 1):
+            priority = TABLE_MIGRATION_PRIORITY.get(tname, 9999)
+            console.print(f"  {idx:3d}. {tname} (priority: {priority})")
 
         with Progress(
             SpinnerColumn(),
@@ -702,10 +766,7 @@ async def migrate() -> None:
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             try:
-                for (table_name,) in tables:
-                    if table_name in ("migratehistory", "alembic_version"):
-                        continue
-
+                for table_name in migration_order:
                     await process_table(
                         table_name,
                         sqlite_cursor,
