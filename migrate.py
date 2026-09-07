@@ -24,11 +24,75 @@ IGNORABLE_SQLITE_FOREIGN_KEY_VIOLATIONS = {
     ("knowledge_file", "knowledge"),
 }
 
+# Migration priority: lower number = migrated first
+# Ensures parent tables are migrated before child tables with FK references
+TABLE_MIGRATION_PRIORITY: Dict[str, int] = {
+    "auth": 10,
+    "user": 20,
+    "config": 25,
+    "model": 30,
+    "function": 35,
+    "tool": 40,
+    "prompt": 45,
+    "skill": 50,
+    "channel": 55,
+    "group": 60,
+    "chat": 70,
+    "knowledge": 75,
+    "folder": 80,
+    "file": 85,
+    "memory": 90,
+    "chatidtag": 95,
+    "tag": 96,
+    "feedback": 97,
+    "message": 98,
+    "message_reaction": 99,
+    "channel_member": 100,
+    "channel_file": 101,
+    "channel_webhook": 102,
+    "chat_file": 110,
+    "chat_message": 111,
+    "shared_chat": 112,
+    "oauth_session": 120,
+    "api_key": 125,
+    "group_member": 130,
+    "document": 140,
+    "prompt_history": 145,
+    "access_grant": 150,
+    "knowledge_directory": 155,
+    "knowledge_file": 160,
+    "automation": 170,
+    "automation_run": 175,
+    "calendar": 180,
+    "calendar_event": 185,
+    "calendar_event_attendee": 190,
+    "pinned_note": 195,
+    "note": 200,
+}
+
+
+def resolve_migration_order(
+    sqlite_tables: List[str],
+) -> List[str]:
+    """Return tables sorted by TABLE_MIGRATION_PRIORITY."""
+    return sorted(
+        [t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")],
+        key=lambda t: TABLE_MIGRATION_PRIORITY.get(t, 9999),
+    )
+
 
 @dataclass
 class SQLiteIntegrityReport:
     passed: bool
     skipped_foreign_key_rowids: Dict[str, List[int]] = field(default_factory=dict)
+
+
+@dataclass
+class TableMigrationResult:
+    """Per-table counters used to build the final reconciliation summary."""
+
+    source_rows: int
+    failed_inserts: int
 
 
 def classify_sqlite_foreign_key_violations(
@@ -401,6 +465,30 @@ def get_pg_safe_identifier(identifier: str) -> str:
     return f'"{identifier}"' if identifier.lower() in reserved_keywords else identifier
 
 
+def is_json_pg_type(pg_data_type: Optional[str]) -> bool:
+    """True when the PostgreSQL column stores JSON (config.value is ``json``,
+    group.* columns are ``jsonb``)."""
+    return (pg_data_type or "").lower() in ("json", "jsonb")
+
+
+def json_sql_literal(value: Any, pg_data_type: Optional[str] = None) -> str:
+    """Render a Python value as a safe SQL literal for a JSON/JSONB column.
+
+    SQLite gives JSON columns NUMERIC affinity, so numbers arrive here as
+    ``int``/``float`` and booleans as ``bool``.  Interpolating those into an
+    INSERT (``VALUES (..., -1, ...)``) makes the expression the wrong type
+    (``column "value" is of type json but expression is of type smallint``)
+    and the row is silently dropped.  Serialising with :func:`json.dumps`
+    preserves the JSON semantics exactly — ``json.dumps(-1)`` is still the
+    JSON number ``-1`` — and produces a string literal that casts cleanly
+    to either ``json`` or ``jsonb``.
+    """
+    encoded = json.dumps(value, ensure_ascii=False)
+    escaped = encoded.replace(chr(39), chr(39) * 2)
+    suffix = "jsonb" if (pg_data_type or "").lower() == "jsonb" else "json"
+    return f"'{escaped}'::{suffix}"
+
+
 @asynccontextmanager
 async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
     sqlite_conn = None
@@ -452,7 +540,7 @@ async def process_table(
     progress: Progress,
     batch_size: int,
     skipped_sqlite_rowids: Optional[List[int]] = None,
-) -> None:
+) -> TableMigrationResult:
     # Special handling for group table
     is_group_table = table_name.lower() == "group"
     if is_group_table:
@@ -582,6 +670,7 @@ async def process_table(
                     rows.append(tuple(cleaned_row))
 
                 for row_index, row in enumerate(rows):
+                    pg_cursor.execute("SAVEPOINT row_sp")
                     try:
                         if is_group_table:
                             console.print(
@@ -597,21 +686,30 @@ async def process_table(
                                 values.append("NULL")
                             elif col_type == "boolean":
                                 values.append("true" if value == 1 else "false")
-                            elif isinstance(value, str):
-                                # Check if this is a JSON column
-                                if col_type == "jsonb":
+                            elif is_json_pg_type(col_type):
+                                # JSON/JSONB column.  SQLite hands these back
+                                # as str (objects), int/float (NUMERIC affinity
+                                # scalars) or bool; every one of those shapes
+                                # is handled here so no row is silently lost.
+                                if isinstance(value, str):
                                     try:
                                         json.loads(value)
-                                        values.append(f"'{value}'::jsonb")
+                                        literal = (
+                                            f"'{value.replace(chr(39), chr(39) * 2)}'::"
+                                            f"{'jsonb' if col_type == 'jsonb' else 'json'}"
+                                        )
                                     except json.JSONDecodeError as e:
                                         console.print(
                                             f"[yellow]Warning: Invalid JSON in {col_name}: {e}[/]"
                                         )
-                                        values.append("'{}'::jsonb")
+                                        literal = "'{}'::json"
                                 else:
-                                    escaped_value = value.replace(chr(39), chr(39) * 2)
-                                    escaped_value = escaped_value.replace("\x00", "")
-                                    values.append(f"'{escaped_value}'")
+                                    literal = json_sql_literal(value, col_type)
+                                values.append(literal)
+                            elif isinstance(value, str):
+                                escaped_value = value.replace(chr(39), chr(39) * 2)
+                                escaped_value = escaped_value.replace("\x00", "")
+                                values.append(f"'{escaped_value}'")
                             else:
                                 values.append(str(value))
 
@@ -623,7 +721,9 @@ async def process_table(
                         if is_group_table:
                             console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
+                        pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
                         if is_group_table:
                             console.print(
                                 f"[red]Error processing group row {processed_rows + row_index}:[/]"
@@ -663,10 +763,60 @@ async def process_table(
                 f"[yellow]Failed to migrate {len(failed_rows)} rows from {table_name}[/]"
             )
 
+        return TableMigrationResult(
+            source_rows=total_rows,
+            failed_inserts=len(failed_rows),
+        )
     except Exception as e:
         pg_cursor.connection.rollback()
         console.print(f"[bold red]Error processing table {table_name}:[/] {str(e)}")
         raise
+
+
+def print_migration_summary(
+    pg_cursor: psycopg.Cursor,
+    results: Dict[str, TableMigrationResult],
+) -> None:
+    """Reconcile SQLite vs PostgreSQL row counts and exit non-zero on partial migration."""
+    summary = Table(title="Migration Summary")
+    summary.add_column("Table", style="cyan")
+    summary.add_column("SQLite rows", justify="right")
+    summary.add_column("PostgreSQL rows", justify="right")
+    summary.add_column("Failed inserts", justify="right")
+    summary.add_column("Status")
+
+    mismatched: List[str] = []
+    for table_name, result in results.items():
+        # A failed INSERT poisons the surrounding pg transaction; roll it
+        # back so this COUNT can run without "transaction is aborted" errors.
+        pg_cursor.connection.rollback()
+        pg_cursor.execute(
+            f"SELECT COUNT(*) FROM {get_pg_safe_identifier(table_name)}"
+        )
+        pg_count = pg_cursor.fetchone()[0]
+
+        ok = pg_count == result.source_rows and result.failed_inserts == 0
+        if not ok:
+            mismatched.append(table_name)
+
+        summary.add_row(
+            table_name,
+            str(result.source_rows),
+            str(pg_count),
+            str(result.failed_inserts),
+            "[green]OK[/]" if ok else "[red]MISMATCH[/]",
+        )
+
+    console.print(summary)
+
+    if mismatched:
+        console.print(
+            f"[bold red]Migration incomplete: source and target row counts "
+            f"differ for {len(mismatched)} table(s): {', '.join(mismatched)}[/]"
+        )
+        sys.exit(1)
+
+    console.print(Panel("Migration Complete!", style="green"))
 
 
 async def migrate() -> None:
@@ -693,8 +843,17 @@ async def migrate() -> None:
         pg_cursor = pg_conn.cursor()
 
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = sqlite_cursor.fetchall()
+        sqlite_table_names = [row[0] for row in sqlite_cursor.fetchall()]
 
+        # Sort tables by priority to ensure FK dependencies are resolved
+        migration_order = resolve_migration_order(sqlite_table_names)
+
+        console.print("\n[cyan]Migration order (by priority):[/]")
+        for idx, tname in enumerate(migration_order, 1):
+            priority = TABLE_MIGRATION_PRIORITY.get(tname, 9999)
+            console.print(f"  {idx:3d}. {tname} (priority: {priority})")
+
+        results: Dict[str, TableMigrationResult] = {}
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -702,11 +861,8 @@ async def migrate() -> None:
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         ) as progress:
             try:
-                for (table_name,) in tables:
-                    if table_name in ("migratehistory", "alembic_version"):
-                        continue
-
-                    await process_table(
+                for table_name in migration_order:
+                    results[table_name] = await process_table(
                         table_name,
                         sqlite_cursor,
                         pg_cursor,
@@ -715,14 +871,14 @@ async def migrate() -> None:
                         integrity_report.skipped_foreign_key_rowids.get(table_name),
                     )
 
-                console.print(Panel("Migration Complete!", style="green"))
-
             except Exception as e:
                 console.print(f"[bold red]Critical error during migration:[/] {e}")
                 console.print("[red]Stack trace:[/]")
                 console.print(traceback.format_exc())
                 pg_conn.rollback()
                 sys.exit(1)
+
+        print_migration_summary(pg_cursor, results)
 
 
 def main():

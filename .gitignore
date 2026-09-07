@@ -1,0 +1,34 @@
+# venv
+.venv/
+venv/
+
+# Python artifacts
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# 852 MB SQLite fixture — never in git
+test_data/*.db
+test_data/*.db-shm
+test_data/*.db-wal
+
+# editor
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# secrets / logs
+.env
+*.log
+run*.log
+claude_run.*
