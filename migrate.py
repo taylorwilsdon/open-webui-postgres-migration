@@ -87,6 +87,14 @@ class SQLiteIntegrityReport:
     skipped_foreign_key_rowids: Dict[str, List[int]] = field(default_factory=dict)
 
 
+@dataclass
+class TableMigrationResult:
+    """Per-table counters used to build the final reconciliation summary."""
+
+    source_rows: int
+    failed_inserts: int
+
+
 def classify_sqlite_foreign_key_violations(
     violations: List[Tuple[str, Optional[int], str, int]],
 ) -> Tuple[Dict[str, List[int]], List[Tuple[str, Optional[int], str, int]]]:
@@ -508,7 +516,7 @@ async def process_table(
     progress: Progress,
     batch_size: int,
     skipped_sqlite_rowids: Optional[List[int]] = None,
-) -> None:
+) -> TableMigrationResult:
     # Special handling for group table
     is_group_table = table_name.lower() == "group"
     if is_group_table:
@@ -722,10 +730,60 @@ async def process_table(
                 f"[yellow]Failed to migrate {len(failed_rows)} rows from {table_name}[/]"
             )
 
+        return TableMigrationResult(
+            source_rows=total_rows,
+            failed_inserts=len(failed_rows),
+        )
     except Exception as e:
         pg_cursor.connection.rollback()
         console.print(f"[bold red]Error processing table {table_name}:[/] {str(e)}")
         raise
+
+
+def print_migration_summary(
+    pg_cursor: psycopg.Cursor,
+    results: Dict[str, TableMigrationResult],
+) -> None:
+    """Reconcile SQLite vs PostgreSQL row counts and exit non-zero on partial migration."""
+    summary = Table(title="Migration Summary")
+    summary.add_column("Table", style="cyan")
+    summary.add_column("SQLite rows", justify="right")
+    summary.add_column("PostgreSQL rows", justify="right")
+    summary.add_column("Failed inserts", justify="right")
+    summary.add_column("Status")
+
+    mismatched: List[str] = []
+    for table_name, result in results.items():
+        # A failed INSERT poisons the surrounding pg transaction; roll it
+        # back so this COUNT can run without "transaction is aborted" errors.
+        pg_cursor.connection.rollback()
+        pg_cursor.execute(
+            f"SELECT COUNT(*) FROM {get_pg_safe_identifier(table_name)}"
+        )
+        pg_count = pg_cursor.fetchone()[0]
+
+        ok = pg_count == result.source_rows and result.failed_inserts == 0
+        if not ok:
+            mismatched.append(table_name)
+
+        summary.add_row(
+            table_name,
+            str(result.source_rows),
+            str(pg_count),
+            str(result.failed_inserts),
+            "[green]OK[/]" if ok else "[red]MISMATCH[/]",
+        )
+
+    console.print(summary)
+
+    if mismatched:
+        console.print(
+            f"[bold red]Migration incomplete: source and target row counts "
+            f"differ for {len(mismatched)} table(s): {', '.join(mismatched)}[/]"
+        )
+        sys.exit(1)
+
+    console.print(Panel("Migration Complete!", style="green"))
 
 
 async def migrate() -> None:
@@ -762,6 +820,7 @@ async def migrate() -> None:
             priority = TABLE_MIGRATION_PRIORITY.get(tname, 9999)
             console.print(f"  {idx:3d}. {tname} (priority: {priority})")
 
+        results: Dict[str, TableMigrationResult] = {}
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
@@ -770,7 +829,7 @@ async def migrate() -> None:
         ) as progress:
             try:
                 for table_name in migration_order:
-                    await process_table(
+                    results[table_name] = await process_table(
                         table_name,
                         sqlite_cursor,
                         pg_cursor,
@@ -779,14 +838,14 @@ async def migrate() -> None:
                         integrity_report.skipped_foreign_key_rowids.get(table_name),
                     )
 
-                console.print(Panel("Migration Complete!", style="green"))
-
             except Exception as e:
                 console.print(f"[bold red]Critical error during migration:[/] {e}")
                 console.print("[red]Stack trace:[/]")
                 console.print(traceback.format_exc())
                 pg_conn.rollback()
                 sys.exit(1)
+
+        print_migration_summary(pg_cursor, results)
 
 
 def main():
