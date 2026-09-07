@@ -582,6 +582,7 @@ async def process_table(
                     rows.append(tuple(cleaned_row))
 
                 for row_index, row in enumerate(rows):
+                    pg_cursor.execute("SAVEPOINT row_sp")
                     try:
                         if is_group_table:
                             console.print(
@@ -623,7 +624,9 @@ async def process_table(
                         if is_group_table:
                             console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
+                        pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
                         if is_group_table:
                             console.print(
                                 f"[red]Error processing group row {processed_rows + row_index}:[/]"
