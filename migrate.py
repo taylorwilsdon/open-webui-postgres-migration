@@ -465,6 +465,30 @@ def get_pg_safe_identifier(identifier: str) -> str:
     return f'"{identifier}"' if identifier.lower() in reserved_keywords else identifier
 
 
+def is_json_pg_type(pg_data_type: Optional[str]) -> bool:
+    """True when the PostgreSQL column stores JSON (config.value is ``json``,
+    group.* columns are ``jsonb``)."""
+    return (pg_data_type or "").lower() in ("json", "jsonb")
+
+
+def json_sql_literal(value: Any, pg_data_type: Optional[str] = None) -> str:
+    """Render a Python value as a safe SQL literal for a JSON/JSONB column.
+
+    SQLite gives JSON columns NUMERIC affinity, so numbers arrive here as
+    ``int``/``float`` and booleans as ``bool``.  Interpolating those into an
+    INSERT (``VALUES (..., -1, ...)``) makes the expression the wrong type
+    (``column "value" is of type json but expression is of type smallint``)
+    and the row is silently dropped.  Serialising with :func:`json.dumps`
+    preserves the JSON semantics exactly — ``json.dumps(-1)`` is still the
+    JSON number ``-1`` — and produces a string literal that casts cleanly
+    to either ``json`` or ``jsonb``.
+    """
+    encoded = json.dumps(value, ensure_ascii=False)
+    escaped = encoded.replace(chr(39), chr(39) * 2)
+    suffix = "jsonb" if (pg_data_type or "").lower() == "jsonb" else "json"
+    return f"'{escaped}'::{suffix}"
+
+
 @asynccontextmanager
 async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
     sqlite_conn = None
@@ -662,21 +686,30 @@ async def process_table(
                                 values.append("NULL")
                             elif col_type == "boolean":
                                 values.append("true" if value == 1 else "false")
-                            elif isinstance(value, str):
-                                # Check if this is a JSON column
-                                if col_type == "jsonb":
+                            elif is_json_pg_type(col_type):
+                                # JSON/JSONB column.  SQLite hands these back
+                                # as str (objects), int/float (NUMERIC affinity
+                                # scalars) or bool; every one of those shapes
+                                # is handled here so no row is silently lost.
+                                if isinstance(value, str):
                                     try:
                                         json.loads(value)
-                                        values.append(f"'{value}'::jsonb")
+                                        literal = (
+                                            f"'{value.replace(chr(39), chr(39) * 2)}'::"
+                                            f"{'jsonb' if col_type == 'jsonb' else 'json'}"
+                                        )
                                     except json.JSONDecodeError as e:
                                         console.print(
                                             f"[yellow]Warning: Invalid JSON in {col_name}: {e}[/]"
                                         )
-                                        values.append("'{}'::jsonb")
+                                        literal = "'{}'::json"
                                 else:
-                                    escaped_value = value.replace(chr(39), chr(39) * 2)
-                                    escaped_value = escaped_value.replace("\x00", "")
-                                    values.append(f"'{escaped_value}'")
+                                    literal = json_sql_literal(value, col_type)
+                                values.append(literal)
+                            elif isinstance(value, str):
+                                escaped_value = value.replace(chr(39), chr(39) * 2)
+                                escaped_value = escaped_value.replace("\x00", "")
+                                values.append(f"'{escaped_value}'")
                             else:
                                 values.append(str(value))
 
