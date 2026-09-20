@@ -471,6 +471,17 @@ def is_json_pg_type(pg_data_type: Optional[str]) -> bool:
     return (pg_data_type or "").lower() in ("json", "jsonb")
 
 
+def json_pg_cast(pg_data_type: Optional[str]) -> str:
+    """The cast suffix to use for a JSON column: ``jsonb`` only when it is."""
+    return "jsonb" if (pg_data_type or "").lower() == "jsonb" else "json"
+
+
+def json_text_sql_literal(json_text: str, pg_data_type: Optional[str] = None) -> str:
+    """Render already-serialised JSON text as a SQL literal, verbatim."""
+    escaped = json_text.replace(chr(39), chr(39) * 2)
+    return f"'{escaped}'::{json_pg_cast(pg_data_type)}"
+
+
 def json_sql_literal(value: Any, pg_data_type: Optional[str] = None) -> str:
     """Render a Python value as a safe SQL literal for a JSON/JSONB column.
 
@@ -479,14 +490,11 @@ def json_sql_literal(value: Any, pg_data_type: Optional[str] = None) -> str:
     INSERT (``VALUES (..., -1, ...)``) makes the expression the wrong type
     (``column "value" is of type json but expression is of type smallint``)
     and the row is silently dropped.  Serialising with :func:`json.dumps`
-    preserves the JSON semantics exactly — ``json.dumps(-1)`` is still the
-    JSON number ``-1`` — and produces a string literal that casts cleanly
+    preserves the JSON semantics exactly (``json.dumps(-1)`` is still the
+    JSON number ``-1``) and produces a string literal that casts cleanly
     to either ``json`` or ``jsonb``.
     """
-    encoded = json.dumps(value, ensure_ascii=False)
-    escaped = encoded.replace(chr(39), chr(39) * 2)
-    suffix = "jsonb" if (pg_data_type or "").lower() == "jsonb" else "json"
-    return f"'{escaped}'::{suffix}"
+    return json_text_sql_literal(json.dumps(value, ensure_ascii=False), pg_data_type)
 
 
 @asynccontextmanager
@@ -694,15 +702,15 @@ async def process_table(
                                 if isinstance(value, str):
                                     try:
                                         json.loads(value)
-                                        literal = (
-                                            f"'{value.replace(chr(39), chr(39) * 2)}'::"
-                                            f"{'jsonb' if col_type == 'jsonb' else 'json'}"
-                                        )
                                     except json.JSONDecodeError as e:
-                                        console.print(
-                                            f"[yellow]Warning: Invalid JSON in {col_name}: {e}[/]"
-                                        )
-                                        literal = "'{}'::json"
+                                        # Substituting '{}' here would destroy
+                                        # the value while still counting the
+                                        # row as migrated; fail it instead so
+                                        # the reconciliation summary reports it.
+                                        raise ValueError(
+                                            f"Invalid JSON in column {col_name}: {e}"
+                                        ) from e
+                                    literal = json_text_sql_literal(value, col_type)
                                 else:
                                     literal = json_sql_literal(value, col_type)
                                 values.append(literal)
@@ -735,7 +743,7 @@ async def process_table(
                                 f"[red]Error processing row in {table_name}: {e}[/]"
                             )
                         failed_rows.append(
-                            (table_name, processed_rows + len(failed_rows), str(e))
+                            (table_name, processed_rows + row_index, str(e))
                         )
                         continue
 

@@ -16,7 +16,7 @@ build/
 coverage.xml
 htmlcov/
 
-# 852 MB SQLite fixture — never in git
+# large SQLite fixtures: never in git
 test_data/*.db
 test_data/*.db-shm
 test_data/*.db-wal

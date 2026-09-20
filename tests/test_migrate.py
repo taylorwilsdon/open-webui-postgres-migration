@@ -1,43 +1,107 @@
 """Unit and integration tests for open-webui-postgres-migrate.
 
-Unit tests (no database required) — run with:
+Unit tests (no database required) run with:
     pytest tests/test_migrate.py -v
 
-PG integration tests (require `ow_fix_pg` podman container on port 54322):
-    PG_TEST_DSN=postgresql://owui:***@127.0.0.1:54322/owui \
-        pytest tests/test_migrate.py -v -k "postgres"
+The PostgreSQL integration tests are opt-in; point PG_TEST_DSN at a scratch
+database (every table they touch is dropped and recreated):
+    PG_TEST_DSN=postgresql://user:pw@127.0.0.1:5432/scratch \
+        pytest tests/test_migrate.py -v
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+import psycopg
+import pytest
+from rich.progress import Progress
 
 import migrate
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # helpers
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
-PG_TEST_DSN: Optional[str] = os.environ.get(
-    "PG_TEST_DSN", "postgresql://owui:***@127.0.0.1:54322/owui"
-)
+PG_TEST_DSN: Optional[str] = os.environ.get("PG_TEST_DSN")
 
 
 def _pg_conn():
-    import psycopg
+    if not PG_TEST_DSN:
+        pytest.skip("No test PostgreSQL (set PG_TEST_DSN)")
     try:
         return psycopg.connect(PG_TEST_DSN, connect_timeout=3)
-    except Exception:
-        import pytest
-        pytest.skip("No local test PostgreSQL (set PG_TEST_DSN)")
+    except psycopg.Error as exc:
+        pytest.skip(f"Test PostgreSQL unreachable: {exc}")
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _migrate_table(
+    tmp_path,
+    name: str,
+    sqlite_ddl: str,
+    rows: List[Tuple[Any, ...]],
+    pg_ddl: str,
+) -> Tuple[migrate.TableMigrationResult, List[Tuple[Any, ...]]]:
+    """Run the real process_table() end to end and return its result + PG rows."""
+    sqlite_conn = sqlite3.connect(tmp_path / f"{name}.db")
+    sqlite_conn.execute(sqlite_ddl)
+    for row in rows:
+        placeholders = ", ".join("?" * len(row))
+        sqlite_conn.execute(f"INSERT INTO {name} VALUES ({placeholders})", row)
+    sqlite_conn.commit()
+
+    pg_conn = _pg_conn()
+    pg_cursor = pg_conn.cursor()
+    try:
+        pg_cursor.execute(f"DROP TABLE IF EXISTS {name}")
+        pg_cursor.execute(pg_ddl)
+        pg_conn.commit()
+
+        with Progress() as progress:
+            result = asyncio.run(
+                migrate.process_table(
+                    name, sqlite_conn.cursor(), pg_cursor, progress, 500
+                )
+            )
+
+        pg_conn.rollback()
+        pg_cursor.execute(f"SELECT * FROM {name} ORDER BY id")
+        return result, pg_cursor.fetchall()
+    finally:
+        pg_conn.rollback()
+        pg_cursor.execute(f"DROP TABLE IF EXISTS {name}")
+        pg_conn.commit()
+        pg_conn.close()
+        sqlite_conn.close()
+
+
+class _FakeCursor:
+    """Minimal psycopg-cursor stand-in for print_migration_summary()."""
+
+    def __init__(self, counts: Dict[str, int]) -> None:
+        self.counts = counts
+        self.connection = self
+        self.rollbacks = 0
+        self._result = 0
+
+    def rollback(self) -> None:
+        self.rollbacks += 1
+
+    def execute(self, query: str) -> None:
+        table = query.rsplit(" ", 1)[-1].strip('"')
+        self._result = self.counts[table]
+
+    def fetchone(self) -> Tuple[int]:
+        return (self._result,)
+
+
+# ----------------------------------------------------------------------------
 # is_json_pg_type
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def test_is_json_pg_type_json_and_jsonb():
     assert migrate.is_json_pg_type("json") is True
@@ -51,12 +115,12 @@ def test_is_json_pg_type_rejects_other_types():
         assert migrate.is_json_pg_type(t) is False, f"should reject {t!r}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# json_sql_literal — the novel regression fix
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
+# json_sql_literal: the novel regression fix
+# ----------------------------------------------------------------------------
 
 def test_json_sql_literal_negative_int_for_json():
-    """The core bug: SQLite NUMERIC affinity → Python int -1."""
+    """The core bug: SQLite NUMERIC affinity turns a JSON -1 into Python int -1."""
     assert migrate.json_sql_literal(-1, "json") == "'-1'::json"
 
 
@@ -92,7 +156,7 @@ def test_json_sql_literal_nested_dict():
 
 def test_json_sql_literal_string_with_single_quote():
     lit = migrate.json_sql_literal("it's here", "json")
-    # JSON encoding: "it's here"  →  '  '"it''s here"'  '::json
+    # JSON encoding of "it's here" yields '"it''s here"'::json
     assert "''" in lit, f"single quote not doubled: {lit!r}"
 
 
@@ -115,15 +179,13 @@ def test_json_sql_literal_does_not_produce_bare_number():
     """Regression: the original bug was VALUES (..., -1, ...) where -1 was a
     bare SQL number literal, rejecting on a json column."""
     lit = migrate.json_sql_literal(-1, "json")
-    # must be a quoted string, not a bare number
-    assert lit.startswith("'"), f"expected SQL string literal, got {lit!r}"
-    assert not lit.split("::")[0].strip().lstrip("'").isdigit() or \
-           lit.startswith("'-1'")
+    # must be a quoted string carrying an explicit ::json cast, not a bare number
+    assert lit == "'-1'::json", f"expected SQL string literal, got {lit!r}"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# resolve_migration_order (Motriys98's priority map — tested via its public API)
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
+# resolve_migration_order (Motriys98's priority map, via its public API)
+# ----------------------------------------------------------------------------
 
 def test_resolve_migration_order_parents_before_children():
     tables = [
@@ -172,9 +234,9 @@ def test_resolve_migration_order_empty():
     assert migrate.resolve_migration_order([]) == []
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # sqlite_to_pg_type
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def test_sqlite_to_pg_type_group_json_columns():
     for col in ("data", "meta", "permissions", "user_ids"):
@@ -192,9 +254,9 @@ def test_sqlite_to_pg_type_unknown_defaults_to_text():
     assert migrate.sqlite_to_pg_type("UNKNOWN_TYPE", "x") == "TEXT"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # get_pg_safe_identifier
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def test_get_pg_safe_identifier_reserved_words_quoted():
     for word in ("user", "group", "order", "table", "select", "where", "from"):
@@ -206,9 +268,9 @@ def test_get_pg_safe_identifier_non_reserved_not_quoted():
     assert migrate.get_pg_safe_identifier("config") == "config"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # build_sqlite_rowid_skip_clause
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 def test_skip_clause_empty():
     clause, params = migrate.build_sqlite_rowid_skip_clause([])
     assert clause == ""
@@ -222,9 +284,9 @@ def test_skip_clause_multiple_rowids():
     assert params == (3, 7, 9)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # classify_sqlite_foreign_key_violations
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def _violations(violations: List[Tuple[str, Optional[int], str, int]]):
     return migrate.classify_sqlite_foreign_key_violations(violations)
@@ -256,9 +318,9 @@ def test_classify_none_rowid_not_skipped():
     assert len(unknown) == 1
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # TableMigrationResult
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def test_table_migration_result_fields():
     r = migrate.TableMigrationResult(source_rows=409, failed_inserts=0)
@@ -266,13 +328,12 @@ def test_table_migration_result_fields():
     assert r.failed_inserts == 0
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 # PG integration tests (require ow_fix_pg running on port 54322)
-# ─────────────────────────────────────────────────────────────────────────────
+# ----------------------------------------------------------------------------
 
 def test_pg_savepoint_isolates_failed_row():
     """A single failed INSERT must not poison subsequent rows (Joly0's fix)."""
-    import psycopg
     conn = _pg_conn()
     cur = conn.cursor()
     try:
@@ -280,7 +341,6 @@ def test_pg_savepoint_isolates_failed_row():
         cur.execute("CREATE TABLE sp_test (id INT, val TEXT NOT NULL)")
         conn.commit()
 
-        rows = [(1, "ok"), (2, "also_ok")]
         cur.execute("SAVEPOINT row_sp")
         try:
             cur.execute("INSERT INTO sp_test (id, val) VALUES (%s, %s)", (1, None))
@@ -304,7 +364,6 @@ def test_pg_savepoint_isolates_failed_row():
 def test_pg_json_literal_inserts_numeric_into_json_column():
     """The core JSON-numeric fix: json_sql_literal output must be accepted by
     a PostgreSQL json column."""
-    import psycopg
     conn = _pg_conn()
     cur = conn.cursor()
     try:
@@ -312,8 +371,8 @@ def test_pg_json_literal_inserts_numeric_into_json_column():
         cur.execute("CREATE TABLE jsoncfg (key TEXT PRIMARY KEY, value JSON)")
         conn.commit()
 
-        # int, float, bool, list — all via json_sql_literal
-        test_values: list[tuple[str, object, str]] = [
+        # int, float, bool, list: all via json_sql_literal
+        test_values: List[Tuple[str, object, Optional[str]]] = [
             ("rag.top_k", 3, migrate.json_sql_literal(3, "json")),
             ("rag.weight", 0.5, migrate.json_sql_literal(0.5, "json")),
             ("version", -1, migrate.json_sql_literal(-1, "json")),
@@ -356,7 +415,6 @@ def test_pg_savepoint_and_sql_literal_combined():
     Uses the same raw-SQL savepoint pattern as migrate.py (not a context
     manager) to mirror the production code path.
     """
-    import psycopg
     conn = _pg_conn()
     cur = conn.cursor()
     try:
@@ -367,11 +425,11 @@ def test_pg_savepoint_and_sql_literal_combined():
 
         # row 1: valid json, goes in (string-interpolated SQL, same as migrate.py)
         lit1 = migrate.json_sql_literal({"a": 1}, "json")
-        cur.execute(f"SAVEPOINT row_sp")
+        cur.execute("SAVEPOINT row_sp")
         cur.execute(f"INSERT INTO combined (key, val) VALUES ('k1', {lit1})")
-        cur.execute(f"RELEASE SAVEPOINT row_sp")
+        cur.execute("RELEASE SAVEPOINT row_sp")
 
-        # row 2: duplicate key → fails; savepoint recovers
+        # row 2: duplicate key, so the insert fails and the savepoint recovers
         lit2 = migrate.json_sql_literal({"b": 2}, "json")
         cur.execute("SAVEPOINT row_sp")
         try:
@@ -403,3 +461,95 @@ def test_pg_savepoint_and_sql_literal_combined():
         except Exception:
             pass
         conn.close()
+
+
+# ----------------------------------------------------------------------------
+# print_migration_summary (no database required)
+# ----------------------------------------------------------------------------
+
+def test_print_migration_summary_all_matching_does_not_exit():
+    cursor = _FakeCursor({"config": 409, "user": 5})
+    migrate.print_migration_summary(
+        cursor,
+        {
+            "config": migrate.TableMigrationResult(source_rows=409, failed_inserts=0),
+            "user": migrate.TableMigrationResult(source_rows=5, failed_inserts=0),
+        },
+    )
+    assert cursor.rollbacks == 2
+
+
+def test_print_migration_summary_row_count_shortfall_exits_non_zero():
+    cursor = _FakeCursor({"config": 379})
+    with pytest.raises(SystemExit) as excinfo:
+        migrate.print_migration_summary(
+            cursor,
+            {"config": migrate.TableMigrationResult(source_rows=409, failed_inserts=0)},
+        )
+    assert excinfo.value.code == 1
+
+
+def test_print_migration_summary_failed_inserts_exit_non_zero():
+    """Counts can line up while inserts failed; that is still a partial migration."""
+    cursor = _FakeCursor({"config": 409})
+    with pytest.raises(SystemExit) as excinfo:
+        migrate.print_migration_summary(
+            cursor,
+            {"config": migrate.TableMigrationResult(source_rows=409, failed_inserts=3)},
+        )
+    assert excinfo.value.code == 1
+
+
+# ----------------------------------------------------------------------------
+# process_table against a real PostgreSQL (opt-in via PG_TEST_DSN)
+# ----------------------------------------------------------------------------
+
+def test_pg_process_table_migrates_numeric_json_values(tmp_path):
+    """End to end: the NUMERIC-affinity rows main silently dropped now land."""
+    result, rows = _migrate_table(
+        tmp_path,
+        "cfg_numeric",
+        "CREATE TABLE cfg_numeric (id INTEGER, value JSON)",
+        [(1, -1), (2, 3.5), (3, '{"a": 1}'), (4, None)],
+        "CREATE TABLE cfg_numeric (id INTEGER, value JSON)",
+    )
+    assert result == migrate.TableMigrationResult(source_rows=4, failed_inserts=0)
+    assert rows == [(1, -1), (2, 3.5), (3, {"a": 1}), (4, None)]
+
+
+def test_pg_process_table_invalid_json_is_a_counted_failure(tmp_path):
+    """A non-JSON value in a json column must fail loudly, never become '{}'."""
+    result, rows = _migrate_table(
+        tmp_path,
+        "cfg_invalid",
+        "CREATE TABLE cfg_invalid (id INTEGER, value TEXT)",
+        [(1, "not json at all"), (2, '{"ok": true}')],
+        "CREATE TABLE cfg_invalid (id INTEGER, value JSON)",
+    )
+    assert result.failed_inserts == 1
+    assert rows == [(2, {"ok": True})], "row 1 must not be stored as an empty object"
+
+
+def test_pg_process_table_savepoint_isolates_failed_row(tmp_path):
+    """One rejected row must not take the rest of its batch down with it."""
+    result, rows = _migrate_table(
+        tmp_path,
+        "sp_rows",
+        "CREATE TABLE sp_rows (id INTEGER, val TEXT)",
+        [(0, "a"), (1, None), (2, "c"), (3, None), (4, "e")],
+        "CREATE TABLE sp_rows (id INTEGER, val TEXT NOT NULL)",
+    )
+    assert result == migrate.TableMigrationResult(source_rows=5, failed_inserts=2)
+    assert [row[0] for row in rows] == [0, 2, 4]
+
+
+def test_pg_process_table_escapes_quotes_in_json_text(tmp_path):
+    """Apostrophes inside JSON text must not break out of the SQL literal."""
+    _, rows = _migrate_table(
+        tmp_path,
+        "quoted_json",
+        "CREATE TABLE quoted_json (id INTEGER, value TEXT)",
+        [(1, '{"a": "it\'s here"}')],
+        "CREATE TABLE quoted_json (id INTEGER, value JSONB)",
+    )
+    assert rows == [(1, {"a": "it's here"})]
