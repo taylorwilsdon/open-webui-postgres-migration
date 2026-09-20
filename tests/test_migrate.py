@@ -183,6 +183,13 @@ def test_json_sql_literal_does_not_produce_bare_number():
     assert lit == "'-1'::json", f"expected SQL string literal, got {lit!r}"
 
 
+def test_json_text_sql_literal_strips_raw_nul():
+    """Raw NUL bytes (unstorable in json/jsonb) are dropped, like the text path."""
+    lit = migrate.json_text_sql_literal('{"a": "b\x00c"}', "jsonb")
+    assert "\x00" not in lit
+    assert lit == "'{\"a\": \"bc\"}'::jsonb"
+
+
 # ----------------------------------------------------------------------------
 # resolve_migration_order (Motriys98's priority map, via its public API)
 # ----------------------------------------------------------------------------
@@ -232,6 +239,38 @@ def test_resolve_migration_order_all_fk_chains():
 
 def test_resolve_migration_order_empty():
     assert migrate.resolve_migration_order([]) == []
+
+
+def test_resolve_migration_order_fk_graph_overrides_priority():
+    """A real FK edge wins even when the priority map disagrees."""
+    # priority puts "note" (200) after "pinned_note" (195), but the FK graph
+    # says pinned_note references note, so note must migrate first.
+    tables = ["pinned_note", "note"]
+    fk = {"pinned_note": {"note"}}
+    ordered = migrate.resolve_migration_order(tables, fk)
+    assert ordered.index("note") < ordered.index("pinned_note")
+
+
+def test_resolve_migration_order_fk_graph_orders_unknown_tables():
+    """Tables absent from the priority map are still placed parents-first."""
+    tables = ["widget_item", "widget"]
+    fk = {"widget_item": {"widget"}}
+    ordered = migrate.resolve_migration_order(tables, fk)
+    assert ordered == ["widget", "widget_item"]
+
+
+def test_resolve_migration_order_fk_cycle_keeps_all_tables():
+    """A cycle degrades to best-effort ordering without dropping a table."""
+    tables = ["a", "b"]
+    fk = {"a": {"b"}, "b": {"a"}}
+    ordered = migrate.resolve_migration_order(tables, fk)
+    assert sorted(ordered) == ["a", "b"]
+
+
+def test_resolve_migration_order_ignores_self_reference():
+    tables = ["tree"]
+    fk = {"tree": {"tree"}}
+    assert migrate.resolve_migration_order(tables, fk) == ["tree"]
 
 
 # ----------------------------------------------------------------------------
@@ -528,6 +567,19 @@ def test_pg_process_table_invalid_json_is_a_counted_failure(tmp_path):
     )
     assert result.failed_inserts == 1
     assert rows == [(2, {"ok": True})], "row 1 must not be stored as an empty object"
+
+
+def test_pg_process_table_empty_string_json_becomes_null(tmp_path):
+    """A blank JSON cell migrates as NULL instead of aborting the whole run."""
+    result, rows = _migrate_table(
+        tmp_path,
+        "cfg_blank",
+        "CREATE TABLE cfg_blank (id INTEGER, value TEXT)",
+        [(1, ""), (2, "   "), (3, '{"ok": true}')],
+        "CREATE TABLE cfg_blank (id INTEGER, value JSONB)",
+    )
+    assert result == migrate.TableMigrationResult(source_rows=3, failed_inserts=0)
+    assert rows == [(1, None), (2, None), (3, {"ok": True})]
 
 
 def test_pg_process_table_savepoint_isolates_failed_row(tmp_path):

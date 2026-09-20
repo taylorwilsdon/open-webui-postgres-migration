@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import json
 import sqlite3
 import sys
@@ -6,7 +7,7 @@ import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg
 from rich.console import Console
@@ -32,8 +33,10 @@ IGNORABLE_SQLITE_FOREIGN_KEY_VIOLATIONS = {
     ("knowledge_file", "knowledge"),
 }
 
-# Migration priority: lower number = migrated first
-# Ensures parent tables are migrated before child tables with FK references
+# Tie-breaker only: when two tables have no FK relationship between them, the
+# lower number is migrated first.  Real parent-before-child ordering is derived
+# from PostgreSQL's own foreign-key graph (see resolve_migration_order), so an
+# entry here never has to be correct against the FK graph, only sensible.
 TABLE_MIGRATION_PRIORITY: Dict[str, int] = {
     "auth": 10,
     "user": 20,
@@ -81,12 +84,71 @@ TABLE_MIGRATION_PRIORITY: Dict[str, int] = {
 
 def resolve_migration_order(
     sqlite_tables: List[str],
+    fk_dependencies: Optional[Dict[str, Set[str]]] = None,
 ) -> List[str]:
-    """Return tables sorted by TABLE_MIGRATION_PRIORITY."""
-    return sorted(
-        [t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")],
-        key=lambda t: TABLE_MIGRATION_PRIORITY.get(t, 9999),
+    """Order tables so every parent precedes its children.
+
+    ``fk_dependencies`` maps a table to the set of tables it references.  When
+    supplied (from PostgreSQL's catalog) a topological sort guarantees a parent
+    is always migrated before its children, so ``TRUNCATE ... CASCADE`` cannot
+    wipe an already-migrated table and no child insert outruns its parent.
+    ``TABLE_MIGRATION_PRIORITY`` only breaks ties between independent tables,
+    keeping the order deterministic and readable.  Without an FK graph this
+    degrades to a plain priority sort.
+    """
+    tables = [
+        t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")
+    ]
+    rank = lambda t: (TABLE_MIGRATION_PRIORITY.get(t, 9999), t)  # noqa: E731
+
+    if not fk_dependencies:
+        return sorted(tables, key=rank)
+
+    present = set(tables)
+    unmet = {
+        t: {p for p in fk_dependencies.get(t, ()) if p in present and p != t}
+        for t in tables
+    }
+    children: Dict[str, List[str]] = {t: [] for t in tables}
+    for table, parents in unmet.items():
+        for parent in parents:
+            children[parent].append(table)
+
+    heap = [rank(t) for t in tables if not unmet[t]]
+    heapq.heapify(heap)
+    ordered: List[str] = []
+    while heap:
+        _, table = heapq.heappop(heap)
+        ordered.append(table)
+        for child in children[table]:
+            unmet[child].discard(table)
+            if not unmet[child]:
+                heapq.heappush(heap, rank(child))
+
+    # Any table still unmet sits in an FK cycle; append it deterministically so
+    # a cycle degrades to a best-effort order rather than dropping tables.
+    ordered.extend(sorted(present.difference(ordered), key=rank))
+    return ordered
+
+
+def get_pg_foreign_key_dependencies(pg_cursor: psycopg.Cursor) -> Dict[str, Set[str]]:
+    """Map each public table to the set of tables it references via a FOREIGN KEY."""
+    pg_cursor.execute(
+        """
+        SELECT tc.table_name, ccu.table_name AS references_table
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.constraint_column_usage AS ccu
+          ON tc.constraint_name = ccu.constraint_name
+         AND tc.table_schema = ccu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+        """
     )
+    dependencies: Dict[str, Set[str]] = {}
+    for table_name, references_table in pg_cursor.fetchall():
+        dependencies.setdefault(table_name, set()).add(references_table)
+    pg_cursor.connection.commit()
+    return dependencies
 
 
 @dataclass
@@ -485,8 +547,13 @@ def json_pg_cast(pg_data_type: Optional[str]) -> str:
 
 
 def json_text_sql_literal(json_text: str, pg_data_type: Optional[str] = None) -> str:
-    """Render already-serialised JSON text as a SQL literal, verbatim."""
-    escaped = json_text.replace(chr(39), chr(39) * 2)
+    """Render already-serialised JSON text as a SQL literal.
+
+    Raw NUL bytes are stripped (neither ``json`` nor ``jsonb`` can store one,
+    and the plain-text path strips them too) before single quotes are doubled.
+    A ``\\u0000`` *escape* is left intact and remains a legitimately failed row.
+    """
+    escaped = json_text.replace("\x00", "").replace(chr(39), chr(39) * 2)
     return f"'{escaped}'::{json_pg_cast(pg_data_type)}"
 
 
@@ -637,6 +704,7 @@ async def process_table(
         progress.update(task_id, total=total_rows)
         processed_rows = 0
         failed_rows = []
+        unreadable_rows = 0
 
         while processed_rows < total_rows:
             try:
@@ -698,7 +766,12 @@ async def process_table(
                                 # as str (objects), int/float (NUMERIC affinity
                                 # scalars) or bool; every one of those shapes
                                 # is handled here so no row is silently lost.
-                                if isinstance(value, str):
+                                if isinstance(value, str) and not value.strip():
+                                    # An empty/blank cell is not valid JSON; a
+                                    # legacy default like "" would otherwise
+                                    # fail the row and abort the whole run.
+                                    values.append("NULL")
+                                elif isinstance(value, str):
                                     try:
                                         json.loads(value)
                                     except json.JSONDecodeError as e:
@@ -709,10 +782,11 @@ async def process_table(
                                         raise ValueError(
                                             f"Invalid JSON in column {col_name}: {e}"
                                         ) from e
-                                    literal = json_text_sql_literal(value, col_type)
+                                    values.append(
+                                        json_text_sql_literal(value, col_type)
+                                    )
                                 else:
-                                    literal = json_sql_literal(value, col_type)
-                                values.append(literal)
+                                    values.append(json_sql_literal(value, col_type))
                             elif isinstance(value, str):
                                 escaped_value = value.replace(chr(39), chr(39) * 2)
                                 escaped_value = escaped_value.replace("\x00", "")
@@ -729,6 +803,7 @@ async def process_table(
                         pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
                         pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                         console.print(
                             f"[red]Error processing row in {table_name}: {e}[/]"
                         )
@@ -742,9 +817,14 @@ async def process_table(
                 progress.update(task_id, completed=processed_rows)
 
             except sqlite3.DatabaseError as e:
+                skipped = min(batch_size, total_rows - processed_rows)
+                unreadable_rows += skipped
                 console.print(f"[red]SQLite error during batch processing: {e}[/]")
-                console.print("[yellow]Attempting to continue with next batch...[/]")
-                processed_rows += batch_size
+                console.print(
+                    f"[yellow]Skipping {skipped} unreadable row(s) and "
+                    "continuing with next batch...[/]"
+                )
+                processed_rows += skipped
                 continue
 
         if failed_rows:
@@ -763,7 +843,7 @@ async def process_table(
 
         return TableMigrationResult(
             source_rows=total_rows,
-            failed_inserts=len(failed_rows),
+            failed_inserts=len(failed_rows) + unreadable_rows,
         )
     except Exception as e:
         pg_cursor.connection.rollback()
@@ -786,8 +866,8 @@ def print_migration_summary(
     mismatched: List[str] = []
     total_source = total_pg = total_failed = 0
     for table_name, result in results.items():
-        # A failed INSERT poisons the surrounding pg transaction; roll it
-        # back so this COUNT can run without "transaction is aborted" errors.
+        # Read each COUNT in its own clean transaction, independent of whatever
+        # state the migration left the connection in.
         pg_cursor.connection.rollback()
         pg_cursor.execute(
             f"SELECT COUNT(*) FROM {get_pg_safe_identifier(table_name)}"
@@ -857,8 +937,10 @@ async def migrate() -> None:
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
         sqlite_table_names = [row[0] for row in sqlite_cursor.fetchall()]
 
-        # Sort tables by priority to ensure FK dependencies are resolved
-        migration_order = resolve_migration_order(sqlite_table_names)
+        # Order tables parents-first, using PostgreSQL's own FK graph so
+        # TRUNCATE CASCADE never wipes an already-migrated table.
+        fk_dependencies = get_pg_foreign_key_dependencies(pg_cursor)
+        migration_order = resolve_migration_order(sqlite_table_names, fk_dependencies)
 
         console.print(
             f"\n[cyan]Migrating {len(migration_order)} tables "
