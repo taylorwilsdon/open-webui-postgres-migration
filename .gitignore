@@ -16,10 +16,16 @@ build/
 coverage.xml
 htmlcov/
 
-# large SQLite fixtures: never in git
-test_data/*.db
-test_data/*.db-shm
-test_data/*.db-wal
+# SQLite databases: never in git, anywhere.
+# These are real Open WebUI databases (password hashes, chat history, API keys).
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# scratch diffs / PR dumps
+pr_*.txt
 
 # editor
 .vscode/
