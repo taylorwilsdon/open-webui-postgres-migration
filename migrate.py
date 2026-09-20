@@ -11,7 +11,15 @@ from typing import Any, Dict, List, Optional, Tuple
 import psycopg
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
@@ -286,7 +294,7 @@ def get_pg_config() -> Dict[str, Any]:
 
         if not tables_exist:
             console.print(
-                f"\n[red]❌ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
+                "\n[red]✗ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
             )
             console.print(f"[yellow]Missing tables: {', '.join(missing_tables)}[/]")
             console.print("\n[yellow]Before running this migration, you must:[/]")
@@ -375,7 +383,7 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                         classify_sqlite_foreign_key_violations(result)
                     )
                     if unknown_violations:
-                        table.add_row(check_name, "❌ Failed")
+                        table.add_row(check_name, "✗ Failed")
                         console.print(table)
                         console.print(
                             f"[red]Failed {check_name}:[/] {unknown_violations}"
@@ -388,16 +396,16 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                     )
                     table.add_row(
                         check_name,
-                        f"⚠️ {total_skipped} orphaned rows will be skipped",
+                        f"! {total_skipped} orphaned rows will be skipped",
                     )
                     continue
 
                 status = (
-                    "✅ Passed" if (result == [("ok",)] or not result) else "❌ Failed"
+                    "✓ Passed" if (result == [("ok",)] or not result) else "✗ Failed"
                 )
                 table.add_row(check_name, status)
 
-                if status == "❌ Failed":
+                if status == "✗ Failed":
                     console.print(table)
                     console.print(f"[red]Failed {check_name}:[/] {result}")
                     return SQLiteIntegrityReport(False)
@@ -549,18 +557,13 @@ async def process_table(
     batch_size: int,
     skipped_sqlite_rowids: Optional[List[int]] = None,
 ) -> TableMigrationResult:
-    # Special handling for group table
-    is_group_table = table_name.lower() == "group"
-    if is_group_table:
-        console.print("[cyan]Processing group table - enabling detailed logging[/]")
-
     pg_safe_table_name = get_pg_safe_identifier(table_name)
     sqlite_safe_table_name = get_sqlite_safe_identifier(table_name)
     skip_clause, skip_params = build_sqlite_rowid_skip_clause(
         skipped_sqlite_rowids or []
     )
 
-    task_id = progress.add_task(f"Migrating {table_name}...", total=100, visible=True)
+    task_id = progress.add_task(f"{table_name}", total=None, visible=True)
 
     try:
         # Truncate existing table
@@ -612,7 +615,6 @@ async def process_table(
                     for col in schema
                 ]
                 create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
-                console.print(f"[cyan]Creating table with query:[/] {create_query}")
                 pg_cursor.execute(create_query)
                 pg_cursor.connection.commit()
             except psycopg.Error as e:
@@ -632,6 +634,7 @@ async def process_table(
             skip_params,
         )
         total_rows = sqlite_cursor.fetchone()[0]
+        progress.update(task_id, total=total_rows)
         processed_rows = 0
         failed_rows = []
 
@@ -680,10 +683,6 @@ async def process_table(
                 for row_index, row in enumerate(rows):
                     pg_cursor.execute("SAVEPOINT row_sp")
                     try:
-                        if is_group_table:
-                            console.print(
-                                f"[cyan]Processing group row {processed_rows + row_index}[/]"
-                            )
                         col_names = [get_pg_safe_identifier(col[1]) for col in schema]
                         values = []
                         for i, value in enumerate(row):
@@ -726,22 +725,13 @@ async def process_table(
                             ({', '.join(col_names)})
                             VALUES ({', '.join(values)})
                         """
-                        if is_group_table:
-                            console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
                         pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
                         pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
-                        if is_group_table:
-                            console.print(
-                                f"[red]Error processing group row {processed_rows + row_index}:[/]"
-                            )
-                            console.print(f"[red]Row data:[/] {row}")
-                            console.print(f"[red]Error details:[/] {str(e)}")
-                        else:
-                            console.print(
-                                f"[red]Error processing row in {table_name}: {e}[/]"
-                            )
+                        console.print(
+                            f"[red]Error processing row in {table_name}: {e}[/]"
+                        )
                         failed_rows.append(
                             (table_name, processed_rows + row_index, str(e))
                         )
@@ -749,7 +739,7 @@ async def process_table(
 
                 processed_rows += len(rows)
                 pg_cursor.connection.commit()
-                progress.update(task_id, completed=(processed_rows / total_rows) * 100)
+                progress.update(task_id, completed=processed_rows)
 
             except sqlite3.DatabaseError as e:
                 console.print(f"[red]SQLite error during batch processing: {e}[/]")
@@ -762,7 +752,7 @@ async def process_table(
             for table, row_num, error in failed_rows:
                 console.print(f"Row {row_num}: {error}")
 
-        progress.update(task_id, completed=100)
+        progress.update(task_id, total=total_rows, completed=processed_rows)
         console.print(
             f"[green]Completed migrating {processed_rows} rows from {table_name}[/]"
         )
@@ -786,14 +776,15 @@ def print_migration_summary(
     results: Dict[str, TableMigrationResult],
 ) -> None:
     """Reconcile SQLite vs PostgreSQL row counts and exit non-zero on partial migration."""
-    summary = Table(title="Migration Summary")
-    summary.add_column("Table", style="cyan")
+    summary = Table(title="Migration Summary", show_footer=True)
+    summary.add_column("Table", style="cyan", footer="Total")
     summary.add_column("SQLite rows", justify="right")
     summary.add_column("PostgreSQL rows", justify="right")
     summary.add_column("Failed inserts", justify="right")
     summary.add_column("Status")
 
     mismatched: List[str] = []
+    total_source = total_pg = total_failed = 0
     for table_name, result in results.items():
         # A failed INSERT poisons the surrounding pg transaction; roll it
         # back so this COUNT can run without "transaction is aborted" errors.
@@ -807,13 +798,26 @@ def print_migration_summary(
         if not ok:
             mismatched.append(table_name)
 
+        total_source += result.source_rows
+        total_pg += pg_count
+        total_failed += result.failed_inserts
+
         summary.add_row(
             table_name,
             str(result.source_rows),
             str(pg_count),
             str(result.failed_inserts),
-            "[green]OK[/]" if ok else "[red]MISMATCH[/]",
+            "[green]✓ OK[/]" if ok else "[red]✗ MISMATCH[/]",
         )
+
+    summary.columns[1].footer = str(total_source)
+    summary.columns[2].footer = str(total_pg)
+    summary.columns[3].footer = str(total_failed)
+    summary.columns[4].footer = (
+        f"[red]✗ {len(mismatched)} mismatched[/]"
+        if mismatched
+        else "[green]✓ OK[/]"
+    )
 
     console.print(summary)
 
@@ -856,17 +860,19 @@ async def migrate() -> None:
         # Sort tables by priority to ensure FK dependencies are resolved
         migration_order = resolve_migration_order(sqlite_table_names)
 
-        console.print("\n[cyan]Migration order (by priority):[/]")
-        for idx, tname in enumerate(migration_order, 1):
-            priority = TABLE_MIGRATION_PRIORITY.get(tname, 9999)
-            console.print(f"  {idx:3d}. {tname} (priority: {priority})")
+        console.print(
+            f"\n[cyan]Migrating {len(migration_order)} tables "
+            "in dependency order.[/]"
+        )
 
         results: Dict[str, TableMigrationResult] = {}
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
         ) as progress:
             try:
                 for table_name in migration_order:
