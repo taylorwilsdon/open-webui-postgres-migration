@@ -33,6 +33,9 @@ IGNORABLE_SQLITE_FOREIGN_KEY_VIOLATIONS = {
     ("knowledge_file", "knowledge"),
 }
 
+# Schema bookkeeping owned by Open WebUI's own migrations; never copied over.
+BOOKKEEPING_TABLES = frozenset({"migratehistory", "alembic_version"})
+
 # Tie-breaker only: when two tables have no FK relationship between them, the
 # lower number is migrated first.  Real parent-before-child ordering is derived
 # from PostgreSQL's own foreign-key graph (see resolve_migration_order), so an
@@ -96,9 +99,7 @@ def resolve_migration_order(
     keeping the order deterministic and readable.  Without an FK graph this
     degrades to a plain priority sort.
     """
-    tables = [
-        t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")
-    ]
+    tables = [t for t in sqlite_tables if t not in BOOKKEEPING_TABLES]
     rank = lambda t: (TABLE_MIGRATION_PRIORITY.get(t, 9999), t)  # noqa: E731
 
     if not fk_dependencies:
@@ -129,6 +130,23 @@ def resolve_migration_order(
     # a cycle degrades to a best-effort order rather than dropping tables.
     ordered.extend(sorted(present.difference(ordered), key=rank))
     return ordered
+
+
+def get_sqlite_table_names(sqlite_path: Path) -> List[str]:
+    """Discover the migratable tables in the source database.
+
+    Table names are read from the source instead of being hard-coded, so the
+    tool follows whatever schema the installed Open WebUI release created.
+    """
+    with sqlite3.connect(sqlite_path) as conn:
+        names = [
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            )
+        ]
+    return [name for name in names if name not in BOOKKEEPING_TABLES]
 
 
 def get_pg_foreign_key_dependencies(pg_cursor: psycopg.Cursor) -> Dict[str, Set[str]]:
@@ -255,23 +273,19 @@ def test_pg_connection(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         return False, f"Unexpected error: {str(e)}"
 
 
-def check_postgres_tables_exist(config: Dict[str, Any]) -> Tuple[bool, List[str]]:
-    """Check if PostgreSQL database has been bootstrapped with Open WebUI tables"""
+def check_postgres_tables_exist(
+    config: Dict[str, Any], expected_tables: List[str]
+) -> Tuple[bool, List[str]]:
+    """Check that PostgreSQL holds every table found in the SQLite source.
+
+    ``expected_tables`` comes from the source database, so any Open WebUI
+    release is supported as long as both databases were created by the same
+    version.  A missing table therefore means PostgreSQL was never bootstrapped
+    or was bootstrapped by a different Open WebUI version.
+    """
     try:
         with psycopg.connect(**config, connect_timeout=5) as conn:
             with conn.cursor() as cur:
-                # Check for common Open WebUI tables
-                expected_tables = [
-                    "user",
-                    "auth",
-                    "chat",
-                    "document",
-                    "model",
-                    "prompt",
-                    "function",
-                    "tool",
-                ]
-
                 cur.execute(
                     """
                     SELECT table_name
@@ -291,7 +305,7 @@ def check_postgres_tables_exist(config: Dict[str, Any]) -> Tuple[bool, List[str]
         return False, [f"Error checking tables: {str(e)}"]
 
 
-def get_pg_config() -> Dict[str, Any]:
+def get_pg_config(expected_tables: List[str]) -> Dict[str, Any]:
     """Interactive configuration for PostgreSQL connection"""
     while True:
         console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
@@ -352,13 +366,19 @@ def get_pg_config() -> Dict[str, Any]:
         with console.status(
             "[cyan]Checking if PostgreSQL database has been bootstrapped...[/]"
         ):
-            tables_exist, missing_tables = check_postgres_tables_exist(config)
+            tables_exist, missing_tables = check_postgres_tables_exist(
+                config, expected_tables
+            )
 
         if not tables_exist:
             console.print(
                 "\n[red]✗ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
             )
             console.print(f"[yellow]Missing tables: {', '.join(missing_tables)}[/]")
+            console.print(
+                "[yellow]Both databases must be created by the same Open WebUI "
+                "version.[/]"
+            )
             console.print("\n[yellow]Before running this migration, you must:[/]")
             console.print(
                 '1. Set DATABASE_URL environment variable: DATABASE_URL="postgresql://user:password@host:port/dbname"'
@@ -922,8 +942,10 @@ async def migrate() -> None:
         )
         sys.exit(1)
 
+    sqlite_table_names = get_sqlite_table_names(sqlite_path)
+
     # Get PostgreSQL configuration
-    pg_config = get_pg_config()
+    pg_config = get_pg_config(sqlite_table_names)
 
     # Get batch size configuration
     batch_size = get_batch_config()
@@ -933,9 +955,6 @@ async def migrate() -> None:
     async with async_db_connections(sqlite_path, pg_config) as (sqlite_conn, pg_conn):
         sqlite_cursor = sqlite_conn.cursor()
         pg_cursor = pg_conn.cursor()
-
-        sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        sqlite_table_names = [row[0] for row in sqlite_cursor.fetchall()]
 
         # Order tables parents-first, using PostgreSQL's own FK graph so
         # TRUNCATE CASCADE never wipes an already-migrated table.
