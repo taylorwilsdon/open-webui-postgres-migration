@@ -1,4 +1,5 @@
 import asyncio
+import heapq
 import json
 import sqlite3
 import sys
@@ -6,12 +7,20 @@ import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 import psycopg
 from rich.console import Console
 from rich.panel import Panel
-from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    BarColumn,
+    MofNCompleteColumn,
+    Progress,
+    SpinnerColumn,
+    TaskProgressColumn,
+    TextColumn,
+    TimeElapsedColumn,
+)
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
@@ -24,11 +33,136 @@ IGNORABLE_SQLITE_FOREIGN_KEY_VIOLATIONS = {
     ("knowledge_file", "knowledge"),
 }
 
+# Tie-breaker only: when two tables have no FK relationship between them, the
+# lower number is migrated first.  Real parent-before-child ordering is derived
+# from PostgreSQL's own foreign-key graph (see resolve_migration_order), so an
+# entry here never has to be correct against the FK graph, only sensible.
+TABLE_MIGRATION_PRIORITY: Dict[str, int] = {
+    "auth": 10,
+    "user": 20,
+    "config": 25,
+    "model": 30,
+    "function": 35,
+    "tool": 40,
+    "prompt": 45,
+    "skill": 50,
+    "channel": 55,
+    "group": 60,
+    "chat": 70,
+    "knowledge": 75,
+    "folder": 80,
+    "file": 85,
+    "memory": 90,
+    "chatidtag": 95,
+    "tag": 96,
+    "feedback": 97,
+    "message": 98,
+    "message_reaction": 99,
+    "channel_member": 100,
+    "channel_file": 101,
+    "channel_webhook": 102,
+    "chat_file": 110,
+    "chat_message": 111,
+    "shared_chat": 112,
+    "oauth_session": 120,
+    "api_key": 125,
+    "group_member": 130,
+    "document": 140,
+    "prompt_history": 145,
+    "access_grant": 150,
+    "knowledge_directory": 155,
+    "knowledge_file": 160,
+    "automation": 170,
+    "automation_run": 175,
+    "calendar": 180,
+    "calendar_event": 185,
+    "calendar_event_attendee": 190,
+    "pinned_note": 195,
+    "note": 200,
+}
+
+
+def resolve_migration_order(
+    sqlite_tables: List[str],
+    fk_dependencies: Optional[Dict[str, Set[str]]] = None,
+) -> List[str]:
+    """Order tables so every parent precedes its children.
+
+    ``fk_dependencies`` maps a table to the set of tables it references.  When
+    supplied (from PostgreSQL's catalog) a topological sort guarantees a parent
+    is always migrated before its children, so ``TRUNCATE ... CASCADE`` cannot
+    wipe an already-migrated table and no child insert outruns its parent.
+    ``TABLE_MIGRATION_PRIORITY`` only breaks ties between independent tables,
+    keeping the order deterministic and readable.  Without an FK graph this
+    degrades to a plain priority sort.
+    """
+    tables = [
+        t for t in sqlite_tables if t not in ("migratehistory", "alembic_version")
+    ]
+    rank = lambda t: (TABLE_MIGRATION_PRIORITY.get(t, 9999), t)  # noqa: E731
+
+    if not fk_dependencies:
+        return sorted(tables, key=rank)
+
+    present = set(tables)
+    unmet = {
+        t: {p for p in fk_dependencies.get(t, ()) if p in present and p != t}
+        for t in tables
+    }
+    children: Dict[str, List[str]] = {t: [] for t in tables}
+    for table, parents in unmet.items():
+        for parent in parents:
+            children[parent].append(table)
+
+    heap = [rank(t) for t in tables if not unmet[t]]
+    heapq.heapify(heap)
+    ordered: List[str] = []
+    while heap:
+        _, table = heapq.heappop(heap)
+        ordered.append(table)
+        for child in children[table]:
+            unmet[child].discard(table)
+            if not unmet[child]:
+                heapq.heappush(heap, rank(child))
+
+    # Any table still unmet sits in an FK cycle; append it deterministically so
+    # a cycle degrades to a best-effort order rather than dropping tables.
+    ordered.extend(sorted(present.difference(ordered), key=rank))
+    return ordered
+
+
+def get_pg_foreign_key_dependencies(pg_cursor: psycopg.Cursor) -> Dict[str, Set[str]]:
+    """Map each public table to the set of tables it references via a FOREIGN KEY."""
+    pg_cursor.execute(
+        """
+        SELECT tc.table_name, ccu.table_name AS references_table
+        FROM information_schema.table_constraints AS tc
+        JOIN information_schema.constraint_column_usage AS ccu
+          ON tc.constraint_name = ccu.constraint_name
+         AND tc.table_schema = ccu.table_schema
+        WHERE tc.constraint_type = 'FOREIGN KEY'
+          AND tc.table_schema = 'public'
+        """
+    )
+    dependencies: Dict[str, Set[str]] = {}
+    for table_name, references_table in pg_cursor.fetchall():
+        dependencies.setdefault(table_name, set()).add(references_table)
+    pg_cursor.connection.commit()
+    return dependencies
+
 
 @dataclass
 class SQLiteIntegrityReport:
     passed: bool
     skipped_foreign_key_rowids: Dict[str, List[int]] = field(default_factory=dict)
+
+
+@dataclass
+class TableMigrationResult:
+    """Per-table counters used to build the final reconciliation summary."""
+
+    source_rows: int
+    failed_inserts: int
 
 
 def classify_sqlite_foreign_key_violations(
@@ -222,7 +356,7 @@ def get_pg_config() -> Dict[str, Any]:
 
         if not tables_exist:
             console.print(
-                f"\n[red]❌ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
+                "\n[red]✗ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
             )
             console.print(f"[yellow]Missing tables: {', '.join(missing_tables)}[/]")
             console.print("\n[yellow]Before running this migration, you must:[/]")
@@ -311,7 +445,7 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                         classify_sqlite_foreign_key_violations(result)
                     )
                     if unknown_violations:
-                        table.add_row(check_name, "❌ Failed")
+                        table.add_row(check_name, "✗ Failed")
                         console.print(table)
                         console.print(
                             f"[red]Failed {check_name}:[/] {unknown_violations}"
@@ -324,16 +458,16 @@ def get_sqlite_integrity_report(db_path: Path) -> SQLiteIntegrityReport:
                     )
                     table.add_row(
                         check_name,
-                        f"⚠️ {total_skipped} orphaned rows will be skipped",
+                        f"! {total_skipped} orphaned rows will be skipped",
                     )
                     continue
 
                 status = (
-                    "✅ Passed" if (result == [("ok",)] or not result) else "❌ Failed"
+                    "✓ Passed" if (result == [("ok",)] or not result) else "✗ Failed"
                 )
                 table.add_row(check_name, status)
 
-                if status == "❌ Failed":
+                if status == "✗ Failed":
                     console.print(table)
                     console.print(f"[red]Failed {check_name}:[/] {result}")
                     return SQLiteIntegrityReport(False)
@@ -401,6 +535,43 @@ def get_pg_safe_identifier(identifier: str) -> str:
     return f'"{identifier}"' if identifier.lower() in reserved_keywords else identifier
 
 
+def is_json_pg_type(pg_data_type: Optional[str]) -> bool:
+    """True when the PostgreSQL column stores JSON (config.value is ``json``,
+    group.* columns are ``jsonb``)."""
+    return (pg_data_type or "").lower() in ("json", "jsonb")
+
+
+def json_pg_cast(pg_data_type: Optional[str]) -> str:
+    """The cast suffix to use for a JSON column: ``jsonb`` only when it is."""
+    return "jsonb" if (pg_data_type or "").lower() == "jsonb" else "json"
+
+
+def json_text_sql_literal(json_text: str, pg_data_type: Optional[str] = None) -> str:
+    """Render already-serialised JSON text as a SQL literal.
+
+    Raw NUL bytes are stripped (neither ``json`` nor ``jsonb`` can store one,
+    and the plain-text path strips them too) before single quotes are doubled.
+    A ``\\u0000`` *escape* is left intact and remains a legitimately failed row.
+    """
+    escaped = json_text.replace("\x00", "").replace(chr(39), chr(39) * 2)
+    return f"'{escaped}'::{json_pg_cast(pg_data_type)}"
+
+
+def json_sql_literal(value: Any, pg_data_type: Optional[str] = None) -> str:
+    """Render a Python value as a safe SQL literal for a JSON/JSONB column.
+
+    SQLite gives JSON columns NUMERIC affinity, so numbers arrive here as
+    ``int``/``float`` and booleans as ``bool``.  Interpolating those into an
+    INSERT (``VALUES (..., -1, ...)``) makes the expression the wrong type
+    (``column "value" is of type json but expression is of type smallint``)
+    and the row is silently dropped.  Serialising with :func:`json.dumps`
+    preserves the JSON semantics exactly (``json.dumps(-1)`` is still the
+    JSON number ``-1``) and produces a string literal that casts cleanly
+    to either ``json`` or ``jsonb``.
+    """
+    return json_text_sql_literal(json.dumps(value, ensure_ascii=False), pg_data_type)
+
+
 @asynccontextmanager
 async def async_db_connections(sqlite_path: Path, pg_config: Dict[str, Any]):
     sqlite_conn = None
@@ -452,19 +623,14 @@ async def process_table(
     progress: Progress,
     batch_size: int,
     skipped_sqlite_rowids: Optional[List[int]] = None,
-) -> None:
-    # Special handling for group table
-    is_group_table = table_name.lower() == "group"
-    if is_group_table:
-        console.print("[cyan]Processing group table - enabling detailed logging[/]")
-
+) -> TableMigrationResult:
     pg_safe_table_name = get_pg_safe_identifier(table_name)
     sqlite_safe_table_name = get_sqlite_safe_identifier(table_name)
     skip_clause, skip_params = build_sqlite_rowid_skip_clause(
         skipped_sqlite_rowids or []
     )
 
-    task_id = progress.add_task(f"Migrating {table_name}...", total=100, visible=True)
+    task_id = progress.add_task(f"{table_name}", total=None, visible=True)
 
     try:
         # Truncate existing table
@@ -516,7 +682,6 @@ async def process_table(
                     for col in schema
                 ]
                 create_query = f"CREATE TABLE IF NOT EXISTS {pg_safe_table_name} ({', '.join(columns)})"
-                console.print(f"[cyan]Creating table with query:[/] {create_query}")
                 pg_cursor.execute(create_query)
                 pg_cursor.connection.commit()
             except psycopg.Error as e:
@@ -536,8 +701,10 @@ async def process_table(
             skip_params,
         )
         total_rows = sqlite_cursor.fetchone()[0]
+        progress.update(task_id, total=total_rows)
         processed_rows = 0
         failed_rows = []
+        unreadable_rows = 0
 
         while processed_rows < total_rows:
             try:
@@ -582,11 +749,8 @@ async def process_table(
                     rows.append(tuple(cleaned_row))
 
                 for row_index, row in enumerate(rows):
+                    pg_cursor.execute("SAVEPOINT row_sp")
                     try:
-                        if is_group_table:
-                            console.print(
-                                f"[cyan]Processing group row {processed_rows + row_index}[/]"
-                            )
                         col_names = [get_pg_safe_identifier(col[1]) for col in schema]
                         values = []
                         for i, value in enumerate(row):
@@ -597,21 +761,36 @@ async def process_table(
                                 values.append("NULL")
                             elif col_type == "boolean":
                                 values.append("true" if value == 1 else "false")
-                            elif isinstance(value, str):
-                                # Check if this is a JSON column
-                                if col_type == "jsonb":
+                            elif is_json_pg_type(col_type):
+                                # JSON/JSONB column.  SQLite hands these back
+                                # as str (objects), int/float (NUMERIC affinity
+                                # scalars) or bool; every one of those shapes
+                                # is handled here so no row is silently lost.
+                                if isinstance(value, str) and not value.strip():
+                                    # An empty/blank cell is not valid JSON; a
+                                    # legacy default like "" would otherwise
+                                    # fail the row and abort the whole run.
+                                    values.append("NULL")
+                                elif isinstance(value, str):
                                     try:
                                         json.loads(value)
-                                        values.append(f"'{value}'::jsonb")
                                     except json.JSONDecodeError as e:
-                                        console.print(
-                                            f"[yellow]Warning: Invalid JSON in {col_name}: {e}[/]"
-                                        )
-                                        values.append("'{}'::jsonb")
+                                        # Substituting '{}' here would destroy
+                                        # the value while still counting the
+                                        # row as migrated; fail it instead so
+                                        # the reconciliation summary reports it.
+                                        raise ValueError(
+                                            f"Invalid JSON in column {col_name}: {e}"
+                                        ) from e
+                                    values.append(
+                                        json_text_sql_literal(value, col_type)
+                                    )
                                 else:
-                                    escaped_value = value.replace(chr(39), chr(39) * 2)
-                                    escaped_value = escaped_value.replace("\x00", "")
-                                    values.append(f"'{escaped_value}'")
+                                    values.append(json_sql_literal(value, col_type))
+                            elif isinstance(value, str):
+                                escaped_value = value.replace(chr(39), chr(39) * 2)
+                                escaped_value = escaped_value.replace("\x00", "")
+                                values.append(f"'{escaped_value}'")
                             else:
                                 values.append(str(value))
 
@@ -620,33 +799,32 @@ async def process_table(
                             ({', '.join(col_names)})
                             VALUES ({', '.join(values)})
                         """
-                        if is_group_table:
-                            console.print(f"[cyan]Executing query:[/]\n{insert_query}")
                         pg_cursor.execute(insert_query)
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
                     except Exception as e:
-                        if is_group_table:
-                            console.print(
-                                f"[red]Error processing group row {processed_rows + row_index}:[/]"
-                            )
-                            console.print(f"[red]Row data:[/] {row}")
-                            console.print(f"[red]Error details:[/] {str(e)}")
-                        else:
-                            console.print(
-                                f"[red]Error processing row in {table_name}: {e}[/]"
-                            )
+                        pg_cursor.execute("ROLLBACK TO SAVEPOINT row_sp")
+                        pg_cursor.execute("RELEASE SAVEPOINT row_sp")
+                        console.print(
+                            f"[red]Error processing row in {table_name}: {e}[/]"
+                        )
                         failed_rows.append(
-                            (table_name, processed_rows + len(failed_rows), str(e))
+                            (table_name, processed_rows + row_index, str(e))
                         )
                         continue
 
                 processed_rows += len(rows)
                 pg_cursor.connection.commit()
-                progress.update(task_id, completed=(processed_rows / total_rows) * 100)
+                progress.update(task_id, completed=processed_rows)
 
             except sqlite3.DatabaseError as e:
+                skipped = min(batch_size, total_rows - processed_rows)
+                unreadable_rows += skipped
                 console.print(f"[red]SQLite error during batch processing: {e}[/]")
-                console.print("[yellow]Attempting to continue with next batch...[/]")
-                processed_rows += batch_size
+                console.print(
+                    f"[yellow]Skipping {skipped} unreadable row(s) and "
+                    "continuing with next batch...[/]"
+                )
+                processed_rows += skipped
                 continue
 
         if failed_rows:
@@ -654,7 +832,7 @@ async def process_table(
             for table, row_num, error in failed_rows:
                 console.print(f"Row {row_num}: {error}")
 
-        progress.update(task_id, completed=100)
+        progress.update(task_id, total=total_rows, completed=processed_rows)
         console.print(
             f"[green]Completed migrating {processed_rows} rows from {table_name}[/]"
         )
@@ -663,10 +841,74 @@ async def process_table(
                 f"[yellow]Failed to migrate {len(failed_rows)} rows from {table_name}[/]"
             )
 
+        return TableMigrationResult(
+            source_rows=total_rows,
+            failed_inserts=len(failed_rows) + unreadable_rows,
+        )
     except Exception as e:
         pg_cursor.connection.rollback()
         console.print(f"[bold red]Error processing table {table_name}:[/] {str(e)}")
         raise
+
+
+def print_migration_summary(
+    pg_cursor: psycopg.Cursor,
+    results: Dict[str, TableMigrationResult],
+) -> None:
+    """Reconcile SQLite vs PostgreSQL row counts and exit non-zero on partial migration."""
+    summary = Table(title="Migration Summary", show_footer=True)
+    summary.add_column("Table", style="cyan", footer="Total")
+    summary.add_column("SQLite rows", justify="right")
+    summary.add_column("PostgreSQL rows", justify="right")
+    summary.add_column("Failed inserts", justify="right")
+    summary.add_column("Status")
+
+    mismatched: List[str] = []
+    total_source = total_pg = total_failed = 0
+    for table_name, result in results.items():
+        # Read each COUNT in its own clean transaction, independent of whatever
+        # state the migration left the connection in.
+        pg_cursor.connection.rollback()
+        pg_cursor.execute(
+            f"SELECT COUNT(*) FROM {get_pg_safe_identifier(table_name)}"
+        )
+        pg_count = pg_cursor.fetchone()[0]
+
+        ok = pg_count == result.source_rows and result.failed_inserts == 0
+        if not ok:
+            mismatched.append(table_name)
+
+        total_source += result.source_rows
+        total_pg += pg_count
+        total_failed += result.failed_inserts
+
+        summary.add_row(
+            table_name,
+            str(result.source_rows),
+            str(pg_count),
+            str(result.failed_inserts),
+            "[green]✓ OK[/]" if ok else "[red]✗ MISMATCH[/]",
+        )
+
+    summary.columns[1].footer = str(total_source)
+    summary.columns[2].footer = str(total_pg)
+    summary.columns[3].footer = str(total_failed)
+    summary.columns[4].footer = (
+        f"[red]✗ {len(mismatched)} mismatched[/]"
+        if mismatched
+        else "[green]✓ OK[/]"
+    )
+
+    console.print(summary)
+
+    if mismatched:
+        console.print(
+            f"[bold red]Migration incomplete: source and target row counts "
+            f"differ for {len(mismatched)} table(s): {', '.join(mismatched)}[/]"
+        )
+        sys.exit(1)
+
+    console.print(Panel("Migration Complete!", style="green"))
 
 
 async def migrate() -> None:
@@ -693,20 +935,30 @@ async def migrate() -> None:
         pg_cursor = pg_conn.cursor()
 
         sqlite_cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
-        tables = sqlite_cursor.fetchall()
+        sqlite_table_names = [row[0] for row in sqlite_cursor.fetchall()]
 
+        # Order tables parents-first, using PostgreSQL's own FK graph so
+        # TRUNCATE CASCADE never wipes an already-migrated table.
+        fk_dependencies = get_pg_foreign_key_dependencies(pg_cursor)
+        migration_order = resolve_migration_order(sqlite_table_names, fk_dependencies)
+
+        console.print(
+            f"\n[cyan]Migrating {len(migration_order)} tables "
+            "in dependency order.[/]"
+        )
+
+        results: Dict[str, TableMigrationResult] = {}
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            MofNCompleteColumn(),
+            TaskProgressColumn(),
+            TimeElapsedColumn(),
         ) as progress:
             try:
-                for (table_name,) in tables:
-                    if table_name in ("migratehistory", "alembic_version"):
-                        continue
-
-                    await process_table(
+                for table_name in migration_order:
+                    results[table_name] = await process_table(
                         table_name,
                         sqlite_cursor,
                         pg_cursor,
@@ -715,14 +967,14 @@ async def migrate() -> None:
                         integrity_report.skipped_foreign_key_rowids.get(table_name),
                     )
 
-                console.print(Panel("Migration Complete!", style="green"))
-
             except Exception as e:
                 console.print(f"[bold red]Critical error during migration:[/] {e}")
                 console.print("[red]Stack trace:[/]")
                 console.print(traceback.format_exc())
                 pg_conn.rollback()
                 sys.exit(1)
+
+        print_migration_summary(pg_cursor, results)
 
 
 def main():

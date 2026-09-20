@@ -49,6 +49,13 @@ open-webui-postgres-migration = "migrate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["."]
+exclude = [
+    "tests",
+    "scripts",
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+]
 
 [tool.hatch.build.targets.sdist]
 include = [
