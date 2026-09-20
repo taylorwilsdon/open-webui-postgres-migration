@@ -3,20 +3,28 @@
 A robust, straightforward and fully interactive tool for migrating Open WebUI databases from SQLite to PostgreSQL. Designed for reliability and ease of use.
 
 ## Preview
-<img width="600" alt="Screenshot 2025-02-20 at 5 25 31 PM" src="https://github.com/user-attachments/assets/d3e9cb13-3aff-455a-9860-8b1d530f5b9d" />
+<img width="600" alt="Screenshot 2025-02-20 at 5 25 31 PM" src="https://github.com/user-attachments/assets/d3e9cb13-3aff-455a-9860-8b1d530f5b9d" />
 
 ## Migration Demo
 https://github.com/user-attachments/assets/5ea8ed51-cc2d-49f0-9f1a-36e2f4e04f30
 
 ## Features
 
-- 🖥️ Interactive command-line interface with clear prompts
-- 🔍 Comprehensive database integrity checking
-- 📦 Configurable batch processing for optimal performance
-- ⚡ Real-time progress visualization
-- 🛡️ Robust error handling and recovery
-- 🔄 Unicode and special character support
-- 🎯 Automatic table structure conversion
+- Interactive command line interface with clear prompts
+- Pre-migration integrity and foreign key verification
+- Automatic table structure conversion, including Unicode and JSON columns
+- Configurable batch processing with real-time progress
+- Per-row error isolation, so one bad row cannot abort a table
+- Failed row tracking and a reconciliation summary at the end
+- Non-zero exit status when source and target row counts disagree
+
+## Supported Open WebUI Versions
+
+All of them, including 0.11.3. There is no version pin and no supported-version list to keep current.
+
+The tool never hard-codes a schema. It discovers the tables in your SQLite file, reads each column type from PostgreSQL, and derives the migration order from PostgreSQL's own foreign key graph, so whatever schema your Open WebUI release created is what gets migrated.
+
+The only requirement is that both databases are created by the same Open WebUI version: bootstrap PostgreSQL by starting your existing Open WebUI build with `DATABASE_URL` set, then run the migration. If a table in your SQLite file is missing from PostgreSQL, the pre-flight check stops and names it, which usually means the two sides were created by different versions.
 
 ## Quick Start
 
@@ -47,91 +55,79 @@ uvx open-webui-postgres-migration
    python migrate.py
    ```
 
+## Requirements
+
+- Python 3.8+
+- PostgreSQL server, running and reachable from the host running the script
+- Sufficient disk space for both databases
+
 ## Best Practices
 
-1. **Before Migration:**
-   - Backup your SQLite database
-   - **CRITICAL: Set up PostgreSQL database and tables FIRST**
-       - Set the `DATABASE_URL` environment variable: `DATABASE_URL="postgresql://user:password@host:port/dbname"`
-       - `export DATABASE_URL="postgresql://user:password@host:port/dbname"` for macOS / Linux
-       - `set DATABASE_URL="postgresql://user:password@host:port/dbname"` for windows
-       - Start Open WebUI with the PostgreSQL `DATABASE_URL` configured to create the database tables
-       - Stop Open WebUI after confirming tables are created
-       - **The migration script will verify this step was completed before proceeding**
-   - Verify PostgreSQL server access from host running script
-   - Check available disk space
+**Before migration**
 
-2. **During Migration:**
-   - Don't interrupt the process
-   - Monitor system resources
-   - Keep network connection stable
+- Back up your SQLite database.
+- **Critical: create the PostgreSQL database and tables first.** The migration script verifies this before proceeding.
+  1. Set the `DATABASE_URL` environment variable to your PostgreSQL connection string:
+     - macOS and Linux: `export DATABASE_URL="postgresql://user:password@host:port/dbname"`
+     - Windows: `set DATABASE_URL="postgresql://user:password@host:port/dbname"`
+  2. Start Open WebUI with that `DATABASE_URL` configured so it creates the tables.
+  3. Stop Open WebUI once the tables exist.
+- Confirm PostgreSQL is reachable from the host running the script.
+- Check available disk space.
 
-3. **After Migration:**
-   - Verify data integrity
-   - Test application functionality
-   - Keep SQLite backup until verified
+**During migration**
 
+- Don't interrupt the process.
+- Monitor system resources.
+- Keep the network connection stable.
 
-## 🔧 Configuration Options
+**After migration**
+
+- Verify data integrity.
+- Test application functionality.
+- Keep the SQLite backup until you have verified the result.
+
+## Configuration Options
 
 During the migration, you'll be prompted to configure:
 
-- **SQLite Database**
+- **SQLite database**
   - Path to your existing SQLite database
   - Automatic validation and integrity checking
 
-- **PostgreSQL Connection**
+- **PostgreSQL connection**
   - Host and port
   - Database name
   - Username and password
   - Connection testing before proceeding
 
-- **Performance Settings**
+- **Performance settings**
   - Batch size (100-5000 recommended)
   - Automatic memory usage warnings
 
-## ⚙️ System Requirements
-
-- Python 3.8+
-- PostgreSQL server (running and accessible)
-- Sufficient disk space for both databases
-- Network access to PostgreSQL server
-
-## 🛡️ Safety Features
-
-- ✅ Pre-migration database integrity verification
-- ✅ Transaction-based processing
-- ✅ Automatic error recovery
-- ✅ Failed row tracking and reporting
-- ✅ Progress preservation on interruption
-
-## 🚨 Troubleshooting
-
-Common issues and solutions:
+## Troubleshooting
 
 | Issue | Solution |
 |-------|----------|
-| Connection Failed | Check PostgreSQL credentials and firewall settings |
-| Permission Denied | Verify PostgreSQL user privileges |
-| Memory Errors | Reduce batch size in configuration |
-| Encoding Issues | Ensure proper database character encoding |
+| Connection failed | Check PostgreSQL credentials and firewall settings |
+| Permission denied | Verify PostgreSQL user privileges |
+| Memory errors | Reduce batch size in configuration |
+| Encoding issues | Ensure proper database character encoding |
+| Missing tables reported before migration starts | PostgreSQL was never bootstrapped, or it was bootstrapped by a different Open WebUI version than the one that created your SQLite file |
 | `Failed Foreign Key Check` for `chat_file` or `knowledge_file` | The migration skips orphaned attachment rows that reference deleted chats or knowledge bases and reports how many rows were skipped |
 
+## Contributing
 
-## 🤝 Contributing
+Contributions are welcome. Please feel free to submit a pull request.
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+## License
 
-## 📄 License
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
-
-## 💬 Support
+## Support
 
 If you encounter issues:
-1. Check the troubleshooting section above
-2. Search existing GitHub issues
-3. Create a new issue with:
-   - Error messages
-   - Database versions
-   - System information
+
+1. Check the troubleshooting section above.
+2. Search existing GitHub issues.
+3. Open a new issue with the error messages, your Open WebUI and database versions, and your system information.

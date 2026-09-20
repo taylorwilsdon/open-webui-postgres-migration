@@ -191,6 +191,49 @@ def test_json_text_sql_literal_strips_raw_nul():
 
 
 # ----------------------------------------------------------------------------
+# get_sqlite_table_names (schema discovery, no hard-coded Open WebUI version)
+# ----------------------------------------------------------------------------
+
+def _write_sqlite_schema(tmp_path, statements):
+    db_path = tmp_path / "discovery.db"
+    conn = sqlite3.connect(db_path)
+    for statement in statements:
+        conn.execute(statement)
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+def test_get_sqlite_table_names_discovers_unknown_tables(tmp_path):
+    """A table from a newer Open WebUI release is discovered, not filtered out."""
+    db_path = _write_sqlite_schema(
+        tmp_path,
+        [
+            'CREATE TABLE "user" (id TEXT PRIMARY KEY)',
+            "CREATE TABLE brand_new_feature (id TEXT PRIMARY KEY)",
+        ],
+    )
+    assert sorted(migrate.get_sqlite_table_names(db_path)) == [
+        "brand_new_feature",
+        "user",
+    ]
+
+
+def test_get_sqlite_table_names_excludes_bookkeeping_and_internal_tables(tmp_path):
+    db_path = _write_sqlite_schema(
+        tmp_path,
+        [
+            "CREATE TABLE alembic_version (version_num TEXT)",
+            "CREATE TABLE migratehistory (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE chat (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "INSERT INTO chat DEFAULT VALUES",
+        ],
+    )
+    # AUTOINCREMENT creates the internal sqlite_sequence table.
+    assert migrate.get_sqlite_table_names(db_path) == ["chat"]
+
+
+# ----------------------------------------------------------------------------
 # resolve_migration_order (Motriys98's priority map, via its public API)
 # ----------------------------------------------------------------------------
 
