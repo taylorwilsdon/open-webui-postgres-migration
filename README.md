@@ -24,7 +24,7 @@ All of them, including 0.11.3. There is no version pin and no supported-version 
 
 The tool never hard-codes a schema. It discovers the tables in your SQLite file, reads each column type from PostgreSQL, and derives the migration order from PostgreSQL's own foreign key graph, so whatever schema your Open WebUI release created is what gets migrated.
 
-The only requirement is that both databases are created by the same Open WebUI version: bootstrap PostgreSQL by starting your existing Open WebUI build with `DATABASE_URL` set, then run the migration. If a table in your SQLite file is missing from PostgreSQL, the pre-flight check stops and names it, which usually means the two sides were created by different versions.
+The only requirement is that both databases are created by the same Open WebUI version: bootstrap PostgreSQL by starting your existing Open WebUI build with `DATABASE_URL` set, then run the migration. If a table or column in your SQLite file is missing from PostgreSQL, the pre-flight check stops and names it, which usually means the two sides were created by different versions.
 
 ## Quick Start
 
@@ -113,7 +113,7 @@ During the migration, you'll be prompted to configure:
 | Permission denied | Verify PostgreSQL user privileges |
 | Memory errors | Reduce batch size in configuration |
 | Encoding issues | Ensure proper database character encoding |
-| Missing tables reported before migration starts | PostgreSQL was never bootstrapped, or it was bootstrapped by a different Open WebUI version than the one that created your SQLite file |
+| Missing tables or columns reported before migration starts | PostgreSQL was never bootstrapped, or it was bootstrapped by a different Open WebUI version than the one that created your SQLite file |
 | `Failed Foreign Key Check` for `chat_file` or `knowledge_file` | The migration skips orphaned attachment rows that reference deleted chats or knowledge bases and reports how many rows were skipped |
 
 ## Contributing
