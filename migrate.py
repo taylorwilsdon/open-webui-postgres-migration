@@ -149,6 +149,42 @@ def get_sqlite_table_names(sqlite_path: Path) -> List[str]:
     return [name for name in names if name not in BOOKKEEPING_TABLES]
 
 
+def get_sqlite_table_columns(sqlite_path: Path) -> Dict[str, List[str]]:
+    """Map each migratable source table to its column names."""
+    with sqlite3.connect(sqlite_path) as conn:
+        return {
+            table: [
+                row[1]
+                for row in conn.execute(
+                    f"PRAGMA table_info({get_sqlite_safe_identifier(table)})"
+                )
+            ]
+            for table in get_sqlite_table_names(sqlite_path)
+        }
+
+
+def find_missing_pg_schema(
+    expected_columns: Dict[str, List[str]], existing_columns: Set[Tuple[str, str]]
+) -> List[str]:
+    """Name every source table, or ``table.column``, absent from PostgreSQL.
+
+    A missing column fails every insert into its table, so it is reported as
+    precisely as a missing table.
+    """
+    existing_tables = {table for table, _ in existing_columns}
+    missing: List[str] = []
+    for table, columns in expected_columns.items():
+        if table not in existing_tables:
+            missing.append(table)
+            continue
+        missing.extend(
+            f"{table}.{column}"
+            for column in columns
+            if (table, column) not in existing_columns
+        )
+    return missing
+
+
 def get_pg_foreign_key_dependencies(pg_cursor: psycopg.Cursor) -> Dict[str, Set[str]]:
     """Map each public table to the set of tables it references via a FOREIGN KEY."""
     pg_cursor.execute(
@@ -273,39 +309,35 @@ def test_pg_connection(config: Dict[str, Any]) -> Tuple[bool, Optional[str]]:
         return False, f"Unexpected error: {str(e)}"
 
 
-def check_postgres_tables_exist(
-    config: Dict[str, Any], expected_tables: List[str]
+def check_postgres_schema(
+    config: Dict[str, Any], expected_columns: Dict[str, List[str]]
 ) -> Tuple[bool, List[str]]:
-    """Check that PostgreSQL holds every table found in the SQLite source.
+    """Check that PostgreSQL holds every table and column in the SQLite source.
 
-    ``expected_tables`` comes from the source database, so any Open WebUI
+    ``expected_columns`` comes from the source database, so any Open WebUI
     release is supported as long as both databases were created by the same
-    version.  A missing table therefore means PostgreSQL was never bootstrapped
-    or was bootstrapped by a different Open WebUI version.
+    version.  A missing table or column therefore means PostgreSQL was never
+    bootstrapped or was bootstrapped by an older Open WebUI version.
     """
     try:
         with psycopg.connect(**config, connect_timeout=5) as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT table_name
-                    FROM information_schema.tables
+                    SELECT table_name, column_name
+                    FROM information_schema.columns
                     WHERE table_schema = 'public'
-                    AND table_type = 'BASE TABLE'
                 """
                 )
-                existing_tables = [row[0] for row in cur.fetchall()]
-
-                missing_tables = [
-                    table for table in expected_tables if table not in existing_tables
-                ]
-
-                return len(missing_tables) == 0, missing_tables
+                missing = find_missing_pg_schema(
+                    expected_columns, set(cur.fetchall())
+                )
+                return not missing, missing
     except Exception as e:
         return False, [f"Error checking tables: {str(e)}"]
 
 
-def get_pg_config(expected_tables: List[str]) -> Dict[str, Any]:
+def get_pg_config(expected_columns: Dict[str, List[str]]) -> Dict[str, Any]:
     """Interactive configuration for PostgreSQL connection"""
     while True:
         console.print(Panel("PostgreSQL Connection Configuration", style="cyan"))
@@ -366,15 +398,14 @@ def get_pg_config(expected_tables: List[str]) -> Dict[str, Any]:
         with console.status(
             "[cyan]Checking if PostgreSQL database has been bootstrapped...[/]"
         ):
-            tables_exist, missing_tables = check_postgres_tables_exist(
-                config, expected_tables
-            )
+            schema_matches, missing = check_postgres_schema(config, expected_columns)
 
-        if not tables_exist:
+        if not schema_matches:
             console.print(
-                "\n[red]✗ PostgreSQL database has not been bootstrapped with Open WebUI tables![/]"
+                "\n[red]✗ PostgreSQL is missing Open WebUI tables or columns "
+                "found in the SQLite source![/]"
             )
-            console.print(f"[yellow]Missing tables: {', '.join(missing_tables)}[/]")
+            console.print(f"[yellow]Missing tables/columns: {', '.join(missing)}[/]")
             console.print(
                 "[yellow]Both databases must be created by the same Open WebUI "
                 "version.[/]"
@@ -942,10 +973,10 @@ async def migrate() -> None:
         )
         sys.exit(1)
 
-    sqlite_table_names = get_sqlite_table_names(sqlite_path)
+    sqlite_columns = get_sqlite_table_columns(sqlite_path)
 
     # Get PostgreSQL configuration
-    pg_config = get_pg_config(sqlite_table_names)
+    pg_config = get_pg_config(sqlite_columns)
 
     # Get batch size configuration
     batch_size = get_batch_config()
@@ -959,7 +990,7 @@ async def migrate() -> None:
         # Order tables parents-first, using PostgreSQL's own FK graph so
         # TRUNCATE CASCADE never wipes an already-migrated table.
         fk_dependencies = get_pg_foreign_key_dependencies(pg_cursor)
-        migration_order = resolve_migration_order(sqlite_table_names, fk_dependencies)
+        migration_order = resolve_migration_order(list(sqlite_columns), fk_dependencies)
 
         console.print(
             f"\n[cyan]Migrating {len(migration_order)} tables "

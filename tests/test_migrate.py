@@ -233,6 +233,40 @@ def test_get_sqlite_table_names_excludes_bookkeeping_and_internal_tables(tmp_pat
     assert migrate.get_sqlite_table_names(db_path) == ["chat"]
 
 
+def test_get_sqlite_table_columns_maps_tables_to_columns(tmp_path):
+    db_path = _write_sqlite_schema(
+        tmp_path,
+        [
+            "CREATE TABLE alembic_version (version_num TEXT)",
+            'CREATE TABLE "user" (id TEXT PRIMARY KEY, name TEXT)',
+        ],
+    )
+    assert migrate.get_sqlite_table_columns(db_path) == {"user": ["id", "name"]}
+
+
+# ----------------------------------------------------------------------------
+# find_missing_pg_schema (pre-flight Open WebUI version drift check)
+# ----------------------------------------------------------------------------
+
+def test_find_missing_pg_schema_reports_column_from_newer_source():
+    """Issue #31: a 0.11.1+ SQLite chat.timer_at against a 0.11.0 PostgreSQL."""
+    expected = {"chat": ["id", "timer_at"], "user": ["id"]}
+    existing = {("chat", "id"), ("user", "id")}
+    assert migrate.find_missing_pg_schema(expected, existing) == ["chat.timer_at"]
+
+
+def test_find_missing_pg_schema_reports_missing_table_once():
+    expected = {"chat": ["id", "title"]}
+    assert migrate.find_missing_pg_schema(expected, set()) == ["chat"]
+
+
+def test_find_missing_pg_schema_ignores_extra_pg_columns():
+    """A newer PostgreSQL schema only adds nullable columns; inserts still work."""
+    expected = {"chat": ["id"]}
+    existing = {("chat", "id"), ("chat", "timer_at")}
+    assert migrate.find_missing_pg_schema(expected, existing) == []
+
+
 # ----------------------------------------------------------------------------
 # resolve_migration_order (Motriys98's priority map, via its public API)
 # ----------------------------------------------------------------------------
